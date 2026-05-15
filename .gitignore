@@ -1,0 +1,38 @@
+# Secrets (never commit; use *.example to share templates)
+esp32/secrets.ini
+**/secrets.ini
+.env
+.env.*
+!.env.example
+
+# Go
+server/bin/
+server/dist/
+*.test
+*.out
+coverage.txt
+
+# PlatformIO
+esp32/.pio/
+esp32/.pioenvs/
+esp32/.piolibdeps/
+esp32/.vscode/
+esp32/.clangd/
+esp32/compile_commands.json
+esp32/sdkconfig
+esp32/sdkconfig.old
+
+# CMake / C++
+console/build/
+console/cmake-build-*/
+*.o
+*.obj
+*.exe
+*.dSYM/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
