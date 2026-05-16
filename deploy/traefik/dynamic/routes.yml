@@ -1,0 +1,25 @@
+http:
+  routers:
+    api:
+      rule: "Host(`{{ env \"SONIC_DOMAIN\" }}`) && (PathPrefix(`/source`) || PathPrefix(`/destination`))"
+      entryPoints:
+        - websecure
+      service: api
+      tls:
+        certResolver: letsencrypt
+    web:
+      rule: "Host(`{{ env \"SONIC_DOMAIN\" }}`)"
+      entryPoints:
+        - websecure
+      service: web
+      tls:
+        certResolver: letsencrypt
+  services:
+    api:
+      loadBalancer:
+        servers:
+          - url: "http://api:3000"
+    web:
+      loadBalancer:
+        servers:
+          - url: "http://web:80"

@@ -6,12 +6,12 @@ services:
       - "80:80"
       - "443:443"
     environment:
+      - SONIC_DOMAIN=${SONIC_DOMAIN}
       - TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_EMAIL=${SONIC_ACME_EMAIL}
-      - DOCKER_API_VERSION=1.43
     volumes:
       - ./deploy/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./deploy/traefik/dynamic:/etc/traefik/dynamic:ro
       - ./deploy/traefik/acme:/acme
-      - /var/run/docker.sock:/var/run/docker.sock:ro
 
   api:
     build:
@@ -19,12 +19,6 @@ services:
     restart: unless-stopped
     expose:
       - "3000"
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.api.rule=Host(`${SONIC_DOMAIN}`) && (PathPrefix(`/source`) || PathPrefix(`/destination`))"
-      - "traefik.http.routers.api.entrypoints=websecure"
-      - "traefik.http.routers.api.tls.certresolver=letsencrypt"
-      - "traefik.http.services.api.loadbalancer.server.port=3000"
 
   web:
     build:
@@ -32,9 +26,3 @@ services:
     restart: unless-stopped
     expose:
       - "80"
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.web.rule=Host(`${SONIC_DOMAIN}`)"
-      - "traefik.http.routers.web.entrypoints=websecure"
-      - "traefik.http.routers.web.tls.certresolver=letsencrypt"
-      - "traefik.http.services.web.loadbalancer.server.port=80"
