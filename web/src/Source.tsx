@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Mp3Encoder } from "lamejs";
+import { Mp3Encoder } from "@breezystack/lamejs";
 import { wsUrl } from "./ws";
 
 type Status = "idle" | "starting" | "live" | "error" | "ended";
