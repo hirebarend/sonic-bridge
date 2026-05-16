@@ -1,4 +1,4 @@
-// sonic-bridge ESP32-C6 firmware.
+// sonic-bridge ESP32-C3 firmware.
 //
 // Captures audio from an INMP441 I2S MEMS microphone, downshifts the 24-bit
 // samples to 16-bit, and streams the raw PCM over TCP to the sonic-bridge
@@ -7,8 +7,18 @@
 // Wire format (must match server + console):
 //   16 kHz, 16-bit signed LE PCM, mono, raw byte stream.
 //
-// WiFi credentials and server address are injected at compile time via
-// build_flags in secrets.ini. See secrets.ini.example.
+// INMP441 wiring (mic pin -> ESP32-C3 GPIO):
+//   VDD -> 3V3
+//   GND -> GND
+//   L/R -> GND          (selects the left I2S slot)
+//   SCK -> SONIC_I2S_SCK    (default GPIO 4)
+//   WS  -> SONIC_I2S_WS     (default GPIO 5)
+//   SD  -> SONIC_I2S_SD     (default GPIO 6)
+//
+// Pin notes (ESP32-C3-DevKitM-1):
+//   - GPIO 4/5/6 are safe general-purpose pins. Other free choices: 7, 8, 10.
+//   - Avoid GPIO 11-17 (SPI flash), 18-19 (USB-JTAG on most modules),
+//     20-21 (UART0 used by Serial), and the strapping pins 2/8/9.
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -17,25 +27,27 @@
 #include "driver/i2s_std.h"
 #include "esp_err.h"
 
-#ifndef SONIC_WIFI_SSID
-#error "SONIC_WIFI_SSID is undefined. Copy secrets.ini.example to secrets.ini and fill it in."
-#endif
-#ifndef SONIC_WIFI_PASS
-#error "SONIC_WIFI_PASS is undefined."
-#endif
-#ifndef SONIC_SERVER_HOST
-#error "SONIC_SERVER_HOST is undefined."
-#endif
-#ifndef SONIC_SERVER_PORT
-#error "SONIC_SERVER_PORT is undefined."
-#endif
+// === Edit these before flashing. ===
+#define SONIC_WIFI_SSID     "your-wifi-ssid"
+#define SONIC_WIFI_PASS     "your-wifi-password"
+#define SONIC_SERVER_HOST   "192.168.1.50"
+#define SONIC_SERVER_PORT   9000
+
+// === Tunables. Edit if you change the wire format, mic shift, or pinout. ===
+#define SONIC_SAMPLE_RATE   16000
+#define SONIC_CHUNK_SAMPLES 1024
+#define SONIC_INMP441_SHIFT 14
+#define SONIC_I2S_SCK       4
+#define SONIC_I2S_WS        5
+#define SONIC_I2S_SD        6
+#define SONIC_RECONNECT_MS  1000
 
 namespace {
 
 constexpr int kSampleRate = SONIC_SAMPLE_RATE;
 constexpr int kChunkSamples = SONIC_CHUNK_SAMPLES;
 constexpr int kChunkBytes = kChunkSamples * 2;
-constexpr int kI2sBclkPin = SONIC_I2S_BCLK;
+constexpr int kI2sSckPin = SONIC_I2S_SCK;
 constexpr int kI2sWsPin = SONIC_I2S_WS;
 constexpr int kI2sSdPin = SONIC_I2S_SD;
 constexpr int kInmpShift = SONIC_INMP441_SHIFT;
@@ -76,7 +88,7 @@ bool setupI2s() {
     std_cfg.slot_cfg.bit_order_lsb = false;
 
     std_cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED;
-    std_cfg.gpio_cfg.bclk = static_cast<gpio_num_t>(kI2sBclkPin);
+    std_cfg.gpio_cfg.bclk = static_cast<gpio_num_t>(kI2sSckPin);
     std_cfg.gpio_cfg.ws   = static_cast<gpio_num_t>(kI2sWsPin);
     std_cfg.gpio_cfg.dout = I2S_GPIO_UNUSED;
     std_cfg.gpio_cfg.din  = static_cast<gpio_num_t>(kI2sSdPin);
