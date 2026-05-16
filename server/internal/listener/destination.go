@@ -55,6 +55,10 @@ func (d *Destination) serveConn(ctx context.Context, conn net.Conn) {
 	remote := conn.RemoteAddr().String()
 	log.Printf("listener[%s] client connected: %s", d.Label, remote)
 
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+	}
+
 	client := d.Hub.Register(remote, d.QueueDepth)
 	defer func() {
 		d.Hub.Unregister(client)
@@ -62,10 +66,23 @@ func (d *Destination) serveConn(ctx context.Context, conn net.Conn) {
 		log.Printf("listener[%s] client disconnected: %s (drops=%d)", d.Label, remote, client.Drops())
 	}()
 
+	// Periodic drop-counter heartbeat. Drops are the canonical signal that a
+	// destination can't keep up; logging them while the stream is live makes
+	// jitter diagnosable instead of only being visible post-mortem.
+	statTicker := time.NewTicker(5 * time.Second)
+	defer statTicker.Stop()
+	var lastDrops uint64
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-statTicker.C:
+			cur := client.Drops()
+			if cur != lastDrops {
+				log.Printf("listener[%s] %s drops=%d (+%d in last 5s)", d.Label, remote, cur, cur-lastDrops)
+				lastDrops = cur
+			}
 		case chunk, ok := <-client.Recv():
 			if !ok {
 				return
