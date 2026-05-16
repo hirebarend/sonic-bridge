@@ -1,28 +1,19 @@
 import { useEffect, useRef, useState } from "react";
-import { PLAYBACK_MIME, wsUrl } from "./ws";
+import { wsUrl } from "./ws";
 
 type Status = "idle" | "starting" | "live" | "error" | "ended";
+
+const SCHEDULE_AHEAD_SEC = 0.1;
 
 function Destination() {
   const [status, setStatus] = useState<Status>("idle");
   const [error, setError] = useState<string | null>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  const mediaSourceRef = useRef<MediaSource | null>(null);
-  const sourceBufferRef = useRef<SourceBuffer | null>(null);
-  const queueRef = useRef<ArrayBuffer[]>([]);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const nextStartTimeRef = useRef(0);
 
   useEffect(() => {
-    return () => {
-      wsRef.current?.close();
-      try {
-        if (mediaSourceRef.current?.readyState === "open") {
-          mediaSourceRef.current.endOfStream();
-        }
-      } catch {
-        // ignore
-      }
-    };
+    return () => cleanup();
   }, []);
 
   function closeWsSilently() {
@@ -35,51 +26,39 @@ function Destination() {
     try { ws.close(); } catch { /* ignore */ }
   }
 
-  function flushQueue() {
-    const sb = sourceBufferRef.current;
-    if (!sb || sb.updating) return;
-    const next = queueRef.current.shift();
-    if (next) {
-      try {
-        sb.appendBuffer(next);
-      } catch (err) {
-        console.error("appendBuffer failed", err);
-      }
-    }
+  function cleanup() {
+    closeWsSilently();
+    try { audioCtxRef.current?.close(); } catch { /* ignore */ }
   }
 
   async function start() {
     setError(null);
     setStatus("starting");
     try {
-      if (!("MediaSource" in window) || !MediaSource.isTypeSupported(PLAYBACK_MIME)) {
-        throw new Error(`browser does not support playback of ${PLAYBACK_MIME}`);
-      }
-      const audio = audioRef.current;
-      if (!audio) throw new Error("audio element missing");
-
-      const mediaSource = new MediaSource();
-      mediaSourceRef.current = mediaSource;
-      audio.src = URL.createObjectURL(mediaSource);
-
-      await new Promise<void>((resolve) => {
-        mediaSource.addEventListener("sourceopen", () => resolve(), { once: true });
-      });
-
-      const sb = mediaSource.addSourceBuffer(PLAYBACK_MIME);
-      sb.mode = "sequence";
-      sb.addEventListener("updateend", flushQueue);
-      sb.addEventListener("error", (e) => console.error("source buffer error", e));
-      sourceBufferRef.current = sb;
+      const AudioCtor: typeof AudioContext =
+        window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const audioCtx = new AudioCtor();
+      audioCtxRef.current = audioCtx;
+      if (audioCtx.state === "suspended") await audioCtx.resume();
 
       const ws = new WebSocket(wsUrl("/destination"));
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
 
-      ws.onmessage = (e) => {
+      ws.onmessage = async (e) => {
         if (!(e.data instanceof ArrayBuffer)) return;
-        queueRef.current.push(e.data);
-        flushQueue();
+        try {
+          const audioBuffer = await audioCtx.decodeAudioData(e.data);
+          const node = audioCtx.createBufferSource();
+          node.buffer = audioBuffer;
+          node.connect(audioCtx.destination);
+          const now = audioCtx.currentTime;
+          const startAt = Math.max(now + SCHEDULE_AHEAD_SEC, nextStartTimeRef.current);
+          node.start(startAt);
+          nextStartTimeRef.current = startAt + audioBuffer.duration;
+        } catch (err) {
+          console.error("decode/play failed", err);
+        }
       };
       ws.onclose = (ev) => {
         console.log("destination ws closed", ev.code, ev.reason);
@@ -92,17 +71,30 @@ function Destination() {
         setStatus("error");
       };
 
-      try {
-        await audio.play();
-      } catch (err) {
-        console.warn("audio.play() rejected, will autoplay when ready", err);
-      }
+      await new Promise<void>((resolve, reject) => {
+        if (ws.readyState === WebSocket.OPEN) return resolve();
+        const onOpen = () => {
+          cleanupListeners();
+          resolve();
+        };
+        const onError = () => {
+          cleanupListeners();
+          reject(new Error("websocket error"));
+        };
+        const cleanupListeners = () => {
+          ws.removeEventListener("open", onOpen);
+          ws.removeEventListener("error", onError);
+        };
+        ws.addEventListener("open", onOpen);
+        ws.addEventListener("error", onError);
+      });
+
       setStatus("live");
     } catch (err) {
       console.error("destination start failed", err);
       setError(err instanceof Error ? err.message : String(err));
       setStatus("error");
-      closeWsSilently();
+      cleanup();
     }
   }
 
@@ -116,10 +108,7 @@ function Destination() {
         {status === "ended" && "ended"}
         {status === "error" && "error"}
       </p>
-      {status === "idle" && (
-        <button onClick={start}>start listening</button>
-      )}
-      <audio ref={audioRef} autoPlay playsInline />
+      {status === "idle" && <button onClick={start}>start listening</button>}
       {error && <p className="error">{error}</p>}
     </section>
   );
