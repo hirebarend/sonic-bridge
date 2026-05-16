@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { MIME, wsUrl } from "./ws";
+import { PLAYBACK_MIME, wsUrl } from "./ws";
 
 type Status = "idle" | "starting" | "live" | "error" | "ended";
 
@@ -25,19 +25,35 @@ function Destination() {
     };
   }, []);
 
+  function closeWsSilently() {
+    const ws = wsRef.current;
+    if (!ws) return;
+    ws.onopen = null;
+    ws.onmessage = null;
+    ws.onerror = null;
+    ws.onclose = null;
+    try { ws.close(); } catch { /* ignore */ }
+  }
+
   function flushQueue() {
     const sb = sourceBufferRef.current;
     if (!sb || sb.updating) return;
     const next = queueRef.current.shift();
-    if (next) sb.appendBuffer(next);
+    if (next) {
+      try {
+        sb.appendBuffer(next);
+      } catch (err) {
+        console.error("appendBuffer failed", err);
+      }
+    }
   }
 
   async function start() {
     setError(null);
     setStatus("starting");
     try {
-      if (!("MediaSource" in window) || !MediaSource.isTypeSupported(MIME)) {
-        throw new Error(`browser does not support ${MIME}`);
+      if (!("MediaSource" in window) || !MediaSource.isTypeSupported(PLAYBACK_MIME)) {
+        throw new Error(`browser does not support playback of ${PLAYBACK_MIME}`);
       }
       const audio = audioRef.current;
       if (!audio) throw new Error("audio element missing");
@@ -50,9 +66,10 @@ function Destination() {
         mediaSource.addEventListener("sourceopen", () => resolve(), { once: true });
       });
 
-      const sb = mediaSource.addSourceBuffer(MIME);
+      const sb = mediaSource.addSourceBuffer(PLAYBACK_MIME);
       sb.mode = "sequence";
       sb.addEventListener("updateend", flushQueue);
+      sb.addEventListener("error", (e) => console.error("source buffer error", e));
       sourceBufferRef.current = sb;
 
       const ws = new WebSocket(wsUrl("/destination"));
@@ -65,20 +82,27 @@ function Destination() {
         flushQueue();
       };
       ws.onclose = (ev) => {
+        console.log("destination ws closed", ev.code, ev.reason);
         setStatus("ended");
         if (ev.code !== 1000) setError(`server closed: ${ev.code} ${ev.reason || ""}`.trim());
       };
-      ws.onerror = () => {
+      ws.onerror = (ev) => {
+        console.error("destination ws error", ev);
         setError("websocket error");
         setStatus("error");
       };
 
-      await audio.play();
+      try {
+        await audio.play();
+      } catch (err) {
+        console.warn("audio.play() rejected, will autoplay when ready", err);
+      }
       setStatus("live");
     } catch (err) {
+      console.error("destination start failed", err);
       setError(err instanceof Error ? err.message : String(err));
       setStatus("error");
-      wsRef.current?.close();
+      closeWsSilently();
     }
   }
 

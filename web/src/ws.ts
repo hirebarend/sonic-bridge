@@ -3,4 +3,5 @@ export function wsUrl(path: "/source" | "/destination"): string {
   return `${proto}//${window.location.host}${path}`;
 }
 
-export const MIME = "audio/webm;codecs=opus";
+export const RECORDER_MIME = "audio/mp4";
+export const PLAYBACK_MIME = 'audio/mp4;codecs="mp4a.40.2"';
