@@ -1,16 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { Mp3Encoder } from "@breezystack/lamejs";
 import { wsUrl } from "./ws";
 
 type Status = "idle" | "starting" | "live" | "error" | "ended";
 
-const MP3_KBPS = 64;
-
-function toArrayBuffer(view: ArrayBufferView): ArrayBuffer {
-  const out = new ArrayBuffer(view.byteLength);
-  new Uint8Array(out).set(new Uint8Array(view.buffer as ArrayBuffer, view.byteOffset, view.byteLength));
-  return out;
-}
+const SAMPLE_RATE = 48000;
 
 function Source() {
   const [status, setStatus] = useState<Status>("idle");
@@ -20,7 +13,6 @@ function Source() {
   const streamRef = useRef<MediaStream | null>(null);
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
-  const encoderRef = useRef<Mp3Encoder | null>(null);
 
   useEffect(() => {
     return () => cleanup();
@@ -40,14 +32,6 @@ function Source() {
     try { workletNodeRef.current?.disconnect(); } catch { /* ignore */ }
     try { sourceNodeRef.current?.disconnect(); } catch { /* ignore */ }
     try { streamRef.current?.getTracks().forEach((t) => t.stop()); } catch { /* ignore */ }
-    try {
-      const enc = encoderRef.current;
-      const ws = wsRef.current;
-      if (enc && ws?.readyState === WebSocket.OPEN) {
-        const tail = enc.flush();
-        if (tail.length > 0) ws.send(toArrayBuffer(tail));
-      }
-    } catch { /* ignore */ }
     try { audioCtxRef.current?.close(); } catch { /* ignore */ }
     closeWsSilently();
   }
@@ -57,21 +41,25 @@ function Source() {
     setStatus("starting");
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+        audio: {
+          channelCount: 1,
+          sampleRate: SAMPLE_RATE,
+          echoCancellation: true,
+          noiseSuppression: true,
+        },
       });
       streamRef.current = stream;
 
       const AudioCtor: typeof AudioContext =
         window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      const audioCtx = new AudioCtor();
+      const audioCtx = new AudioCtor({ sampleRate: SAMPLE_RATE });
       audioCtxRef.current = audioCtx;
       if (audioCtx.state === "suspended") await audioCtx.resume();
+      if (audioCtx.sampleRate !== SAMPLE_RATE) {
+        throw new Error(`AudioContext rate mismatch: got ${audioCtx.sampleRate}, need ${SAMPLE_RATE}`);
+      }
 
       await audioCtx.audioWorklet.addModule("/recorder-worklet.js");
-
-      const sampleRate = audioCtx.sampleRate;
-      const encoder = new Mp3Encoder(1, sampleRate, MP3_KBPS);
-      encoderRef.current = encoder;
 
       const ws = new WebSocket(wsUrl("/source"));
       ws.binaryType = "arraybuffer";
@@ -95,21 +83,21 @@ function Source() {
 
       const sourceNode = audioCtx.createMediaStreamSource(stream);
       const workletNode = new AudioWorkletNode(audioCtx, "recorder");
+      const silentSink = audioCtx.createGain();
+      silentSink.gain.value = 0;
       sourceNode.connect(workletNode);
+      workletNode.connect(silentSink);
+      silentSink.connect(audioCtx.destination);
       sourceNodeRef.current = sourceNode;
       workletNodeRef.current = workletNode;
 
-      workletNode.port.onmessage = (e: MessageEvent<Float32Array>) => {
-        const samples = e.data;
-        const int16 = new Int16Array(samples.length);
-        for (let i = 0; i < samples.length; i++) {
-          const s = Math.max(-1, Math.min(1, samples[i]));
-          int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-        }
-        const mp3 = encoder.encodeBuffer(int16);
-        if (mp3.length > 0 && ws.readyState === WebSocket.OPEN) {
-          ws.send(toArrayBuffer(mp3));
-        }
+      let chunks = 0;
+      workletNode.port.onmessage = (e: MessageEvent<ArrayBuffer>) => {
+        if (!(e.data instanceof ArrayBuffer)) return;
+        if (ws.readyState !== WebSocket.OPEN) return;
+        chunks++;
+        if (chunks === 1) console.log("source: first PCM chunk", e.data.byteLength, "bytes");
+        ws.send(e.data);
       };
 
       setStatus("live");
