@@ -7,6 +7,7 @@ services:
       - "443:443"
     environment:
       - TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_EMAIL=${SONIC_ACME_EMAIL}
+      - DOCKER_API_VERSION=1.43
     volumes:
       - ./deploy/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
       - ./deploy/traefik/acme:/acme
