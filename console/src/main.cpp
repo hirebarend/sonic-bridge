@@ -28,8 +28,8 @@
 
 namespace {
 
-constexpr int kSampleRate = 16000;
-constexpr int kFramesPerBuffer = 1024;            // 64 ms per audio callback
+constexpr int kSampleRate = 8000;
+constexpr int kFramesPerBuffer = 1024;            // 128 ms per audio callback
 constexpr size_t kRingSamples = kSampleRate;      // ~1 s ring
 constexpr size_t kPrefillSamples = kSampleRate / 6; // ~167 ms before playback starts
 constexpr size_t kRecvBufBytes = 8 * 1024;        // 4096 samples per recv() max

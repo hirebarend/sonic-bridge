@@ -17,10 +17,10 @@ import (
 )
 
 const (
-	sampleRate    = 16000
+	sampleRate    = 8000
 	chunkSamples  = 1024
 	chunkBytes    = chunkSamples * 2
-	chunkInterval = time.Second * time.Duration(chunkSamples) / time.Duration(sampleRate) // 64 ms
+	chunkInterval = time.Second * time.Duration(chunkSamples) / time.Duration(sampleRate) // 128 ms
 )
 
 func main() {

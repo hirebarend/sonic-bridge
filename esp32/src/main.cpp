@@ -44,7 +44,7 @@
 #define SONIC_SERVER_PORT   9000
 
 // === Tunables. Edit if you change the wire format, mic shift, or pinout. ===
-#define SONIC_SAMPLE_RATE   16000
+#define SONIC_SAMPLE_RATE   8000
 #define SONIC_CHUNK_SAMPLES 1024
 #define SONIC_INMP441_SHIFT 14
 #define SONIC_I2S_SCK       4
