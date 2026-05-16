@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="${REPO_URL:-https://github.com/REPLACE_ME/sonic-bridge.git}"
-REPO_BRANCH="${REPO_BRANCH:-main}"
+REPO_URL="${REPO_URL:-https://github.com/hirebarend/sonic-bridge.git}"
+REPO_BRANCH="${REPO_BRANCH:-web}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/sonic-bridge}"
 
 if [[ $EUID -ne 0 ]]; then
