@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createAudioContext, scheduleChunk } from "./utils";
+import { useWakeLock } from "./use-wake-lock";
 import { useWebSocket } from "./use-web-socket";
 
 function Destination() {
@@ -7,7 +8,7 @@ function Destination() {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const nextStartTimeRef = useRef(0);
 
-  const webSocket = useWebSocket("/destination", {
+  const { close, connect, status } = useWebSocket("/destination", {
     onMessage(data) {
       const audioCtx = audioCtxRef.current;
 
@@ -22,15 +23,15 @@ function Destination() {
       );
     },
     onClose() {
-      setIsRunning(false);
+      nextStartTimeRef.current = 0;
     },
-    onError() {
-      setIsRunning(false);
-    },
+    onError() {},
   });
 
+  useWakeLock(isRunning);
+
   const cleanup = useCallback(() => {
-    webSocket.close();
+    close();
 
     try {
       audioCtxRef.current?.close();
@@ -40,11 +41,19 @@ function Destination() {
 
     audioCtxRef.current = null;
     nextStartTimeRef.current = 0;
-  }, [webSocket.close]);
+  }, [close]);
 
   useEffect(() => {
     return cleanup;
   }, [cleanup]);
+
+  const buttonLabel = !isRunning
+    ? "Start listening"
+    : status === "connecting"
+      ? "Connecting"
+      : status === "reconnecting"
+        ? "Reconnecting"
+        : "Listening";
 
   async function start() {
     setIsRunning(true);
@@ -54,8 +63,8 @@ function Destination() {
       audioCtxRef.current = audioCtx;
       nextStartTimeRef.current = 0;
 
-      await webSocket.connect();
-    } catch (err) {
+      await connect();
+    } catch {
       setIsRunning(false);
       cleanup();
     }
@@ -67,7 +76,7 @@ function Destination() {
       disabled={isRunning}
       onClick={start}
     >
-      {isRunning ? "Listening" : "Start listening"}
+      {buttonLabel}
     </button>
   );
 }

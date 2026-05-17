@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createAudioContext } from "./utils";
+import { useWakeLock } from "./use-wake-lock";
 import { useWebSocket } from "./use-web-socket";
 
 const SAMPLE_RATE = 48000;
@@ -23,20 +24,11 @@ function Source() {
     useRef<MediaStreamAudioSourceNode | null>(null);
   const audioWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
 
-  const webSocket = useWebSocket("/source", {
-    onClose() {
-      setIsRunning(false);
-
-      try {
-        audioWorkletNodeRef.current?.disconnect();
-      } catch {
-        /* ignore */
-      }
-
-      mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
-    },
+  const { close, connect, send, status } = useWebSocket("/source", {
     onError() {},
   });
+
+  useWakeLock(isRunning);
 
   const cleanup = useCallback(() => {
     try {
@@ -59,16 +51,24 @@ function Source() {
     } catch {
       /* ignore */
     }
-    webSocket.close();
+    close();
     audioCtxRef.current = null;
     mediaStreamRef.current = null;
     mediaStreamAudioSourceNodeRef.current = null;
     audioWorkletNodeRef.current = null;
-  }, [webSocket.close]);
+  }, [close]);
 
   useEffect(() => {
     return cleanup;
   }, [cleanup]);
+
+  const buttonLabel = !isRunning
+    ? "Start streaming"
+    : status === "connecting"
+      ? "Connecting"
+      : status === "reconnecting"
+        ? "Reconnecting"
+        : "Streaming";
 
   async function start() {
     setIsRunning(true);
@@ -81,7 +81,7 @@ function Source() {
       audioCtxRef.current = audioCtx;
       await audioCtx.audioWorklet.addModule("/recorder-worklet.js");
 
-      await webSocket.connect();
+      await connect();
 
       const sourceNode = audioCtx.createMediaStreamSource(mediaStream);
       const workletNode = new AudioWorkletNode(audioCtx, "recorder");
@@ -98,11 +98,11 @@ function Source() {
           return;
         }
 
-        if (!webSocket.send(e.data)) {
+        if (!send(e.data)) {
           return;
         }
       };
-    } catch (err) {
+    } catch {
       setIsRunning(false);
       cleanup();
     }
@@ -114,7 +114,7 @@ function Source() {
       disabled={isRunning}
       onClick={start}
     >
-      {isRunning ? "Streaming" : "Start streaming"}
+      {buttonLabel}
     </button>
   );
 }
