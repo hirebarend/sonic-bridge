@@ -6,7 +6,7 @@ const HOST = process.env.HOST ?? "0.0.0.0";
 
 const server = createServer((_req, res) => {
   res.writeHead(200, { "content-type": "text/plain" });
-  res.end("sonic-bridge api\n");
+  res.end("Hello World!\n");
 });
 
 const sourceWss = new WebSocketServer({ noServer: true });
@@ -20,11 +20,15 @@ sourceWss.on("connection", (ws) => {
     ws.close(1013, "source already connected");
     return;
   }
+
   source = ws;
   console.log("source connected");
 
   ws.on("message", (data, isBinary) => {
-    if (!isBinary) return;
+    if (!isBinary) {
+      return;
+    }
+
     for (const dest of destinations) {
       if (dest.readyState === WebSocket.OPEN) {
         dest.send(data, { binary: true });
@@ -33,7 +37,10 @@ sourceWss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
-    if (source === ws) source = null;
+    if (source === ws) {
+      source = null;
+    }
+
     console.log("source disconnected");
   });
 
@@ -58,6 +65,7 @@ destinationWss.on("connection", (ws) => {
 
 server.on("upgrade", (req, socket, head) => {
   const { url } = req;
+
   if (url === "/source") {
     sourceWss.handleUpgrade(req, socket, head, (ws) => {
       sourceWss.emit("connection", ws, req);

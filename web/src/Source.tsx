@@ -1,127 +1,121 @@
-import { useEffect, useRef, useState } from "react";
-import { wsUrl } from "./ws";
-
-type Status = "idle" | "starting" | "live" | "error" | "ended";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { createAudioContext } from "./utils";
+import { useWebSocket } from "./use-web-socket";
 
 const SAMPLE_RATE = 48000;
 
+function getMediaStream() {
+  return navigator.mediaDevices.getUserMedia({
+    audio: {
+      channelCount: 1,
+      sampleRate: SAMPLE_RATE,
+      echoCancellation: true,
+      noiseSuppression: true,
+    },
+  });
+}
+
 function Source() {
-  const [status, setStatus] = useState<Status>("idle");
-  const [error, setError] = useState<string | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
+  const [isRunning, setIsRunning] = useState(false);
   const audioCtxRef = useRef<AudioContext | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const mediaStreamAudioSourceNodeRef =
+    useRef<MediaStreamAudioSourceNode | null>(null);
+  const audioWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
 
-  useEffect(() => {
-    return () => cleanup();
-  }, []);
+  const webSocket = useWebSocket("/source", {
+    onClose() {
+      setIsRunning(false);
 
-  function closeWsSilently() {
-    const ws = wsRef.current;
-    if (!ws) return;
-    ws.onopen = null;
-    ws.onmessage = null;
-    ws.onerror = null;
-    ws.onclose = null;
-    try { ws.close(); } catch { /* ignore */ }
-  }
-
-  function cleanup() {
-    try { workletNodeRef.current?.disconnect(); } catch { /* ignore */ }
-    try { sourceNodeRef.current?.disconnect(); } catch { /* ignore */ }
-    try { streamRef.current?.getTracks().forEach((t) => t.stop()); } catch { /* ignore */ }
-    try { audioCtxRef.current?.close(); } catch { /* ignore */ }
-    closeWsSilently();
-  }
-
-  async function start() {
-    setError(null);
-    setStatus("starting");
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          sampleRate: SAMPLE_RATE,
-          echoCancellation: true,
-          noiseSuppression: true,
-        },
-      });
-      streamRef.current = stream;
-
-      const AudioCtor: typeof AudioContext =
-        window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      const audioCtx = new AudioCtor({ sampleRate: SAMPLE_RATE });
-      audioCtxRef.current = audioCtx;
-      if (audioCtx.state === "suspended") await audioCtx.resume();
-      if (audioCtx.sampleRate !== SAMPLE_RATE) {
-        throw new Error(`AudioContext rate mismatch: got ${audioCtx.sampleRate}, need ${SAMPLE_RATE}`);
+      try {
+        audioWorkletNodeRef.current?.disconnect();
+      } catch {
+        /* ignore */
       }
 
+      mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    },
+    onError() {},
+  });
+
+  const cleanup = useCallback(() => {
+    try {
+      audioWorkletNodeRef.current?.disconnect();
+    } catch {
+      /* ignore */
+    }
+    try {
+      mediaStreamAudioSourceNodeRef.current?.disconnect();
+    } catch {
+      /* ignore */
+    }
+    try {
+      mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+    } catch {
+      /* ignore */
+    }
+    try {
+      audioCtxRef.current?.close();
+    } catch {
+      /* ignore */
+    }
+    webSocket.close();
+    audioCtxRef.current = null;
+    mediaStreamRef.current = null;
+    mediaStreamAudioSourceNodeRef.current = null;
+    audioWorkletNodeRef.current = null;
+  }, [webSocket.close]);
+
+  useEffect(() => {
+    return cleanup;
+  }, [cleanup]);
+
+  async function start() {
+    setIsRunning(true);
+
+    try {
+      const mediaStream = await getMediaStream();
+      mediaStreamRef.current = mediaStream;
+
+      const audioCtx = await createAudioContext();
+      audioCtxRef.current = audioCtx;
       await audioCtx.audioWorklet.addModule("/recorder-worklet.js");
 
-      const ws = new WebSocket(wsUrl("/source"));
-      ws.binaryType = "arraybuffer";
-      wsRef.current = ws;
+      await webSocket.connect();
 
-      await new Promise<void>((resolve, reject) => {
-        ws.onopen = () => resolve();
-        ws.onerror = () => reject(new Error("websocket error"));
-        ws.onclose = (ev) =>
-          reject(new Error(`websocket closed before open: ${ev.code} ${ev.reason || ""}`.trim()));
-      });
-
-      ws.onerror = (ev) => console.error("source ws error", ev);
-      ws.onclose = (ev) => {
-        console.log("source ws closed", ev.code, ev.reason);
-        setStatus("ended");
-        if (ev.code !== 1000) setError(`server closed: ${ev.code} ${ev.reason || ""}`.trim());
-        try { workletNodeRef.current?.disconnect(); } catch { /* ignore */ }
-        streamRef.current?.getTracks().forEach((t) => t.stop());
-      };
-
-      const sourceNode = audioCtx.createMediaStreamSource(stream);
+      const sourceNode = audioCtx.createMediaStreamSource(mediaStream);
       const workletNode = new AudioWorkletNode(audioCtx, "recorder");
       const silentSink = audioCtx.createGain();
       silentSink.gain.value = 0;
       sourceNode.connect(workletNode);
       workletNode.connect(silentSink);
       silentSink.connect(audioCtx.destination);
-      sourceNodeRef.current = sourceNode;
-      workletNodeRef.current = workletNode;
+      mediaStreamAudioSourceNodeRef.current = sourceNode;
+      audioWorkletNodeRef.current = workletNode;
 
-      let chunks = 0;
       workletNode.port.onmessage = (e: MessageEvent<ArrayBuffer>) => {
-        if (!(e.data instanceof ArrayBuffer)) return;
-        if (ws.readyState !== WebSocket.OPEN) return;
-        chunks++;
-        if (chunks === 1) console.log("source: first PCM chunk", e.data.byteLength, "bytes");
-        ws.send(e.data);
-      };
+        if (!(e.data instanceof ArrayBuffer)) {
+          return;
+        }
 
-      setStatus("live");
+        if (!webSocket.send(e.data)) {
+          return;
+        }
+      };
     } catch (err) {
-      console.error("source start failed", err);
-      setError(err instanceof Error ? err.message : String(err));
-      setStatus("error");
+      setIsRunning(false);
       cleanup();
     }
   }
 
   return (
-    <section className="panel">
-      <p className="role">source</p>
-      <p className={`status status-${status}`}>
-        {status === "idle" && "ready"}
-        {status === "starting" && "starting…"}
-        {status === "live" && "live"}
-        {status === "ended" && "ended"}
-        {status === "error" && "error"}
-      </p>
-      {status === "idle" && <button onClick={start}>start streaming</button>}
-      {error && <p className="error">{error}</p>}
-    </section>
+    <button
+      className="min-w-40 rounded-full border border-neutral-700 bg-neutral-900 px-6 py-3 text-sm font-medium text-neutral-50 shadow-sm transition hover:border-neutral-500 hover:bg-neutral-800 focus:outline-none focus:ring-2 focus:ring-neutral-400 focus:ring-offset-2 focus:ring-offset-neutral-950 disabled:cursor-default disabled:border-emerald-500/40 disabled:bg-emerald-500/10 disabled:text-emerald-200"
+      disabled={isRunning}
+      onClick={start}
+    >
+      {isRunning ? "Streaming" : "Start streaming"}
+    </button>
   );
 }
 

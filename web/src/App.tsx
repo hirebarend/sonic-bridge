@@ -6,8 +6,7 @@ function App() {
   const type = params.get("type") === "source" ? "source" : "destination";
 
   return (
-    <main className="app">
-      <h1>sonic-bridge</h1>
+    <main className="flex min-h-dvh items-center justify-center bg-neutral-950 p-6 text-neutral-50">
       {type === "source" ? <Source /> : <Destination />}
     </main>
   );
