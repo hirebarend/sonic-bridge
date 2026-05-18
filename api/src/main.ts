@@ -1,8 +1,9 @@
 import { createServer } from "node:http";
-import { WebSocketServer, WebSocket } from "ws";
+import { WebSocketServer, WebSocket, type RawData } from "ws";
 
 const PORT = Number(process.env.PORT ?? 3000);
 const HOST = process.env.HOST ?? "0.0.0.0";
+const BYTE_RATE_LOG_INTERVAL_MS = 5_000;
 
 const server = createServer((_req, res) => {
   res.writeHead(200, { "content-type": "text/plain" });
@@ -14,6 +15,38 @@ const destinationWss = new WebSocketServer({ noServer: true });
 
 let source: WebSocket | null = null;
 const destinations = new Set<WebSocket>();
+let sourceBytesReceived = 0;
+let sourceByteRateWindowStartedAt = Date.now();
+
+function rawDataByteLength(data: RawData) {
+  if (Array.isArray(data)) {
+    return data.reduce((total, chunk) => total + chunk.byteLength, 0);
+  }
+
+  return data.byteLength;
+}
+
+const sourceByteRateTimer = setInterval(() => {
+  if (!source) {
+    sourceBytesReceived = 0;
+    sourceByteRateWindowStartedAt = Date.now();
+    return;
+  }
+
+  const now = Date.now();
+  const elapsedSeconds = (now - sourceByteRateWindowStartedAt) / 1_000;
+  const bytesPerSecond =
+    elapsedSeconds > 0 ? sourceBytesReceived / elapsedSeconds : 0;
+
+  console.log(
+    `source inbound: ${bytesPerSecond.toFixed(0)} B/s (${sourceBytesReceived} bytes over ${elapsedSeconds.toFixed(1)}s)`,
+  );
+
+  sourceBytesReceived = 0;
+  sourceByteRateWindowStartedAt = now;
+}, BYTE_RATE_LOG_INTERVAL_MS);
+
+sourceByteRateTimer.unref();
 
 sourceWss.on("connection", (ws) => {
   if (source) {
@@ -22,12 +55,16 @@ sourceWss.on("connection", (ws) => {
   }
 
   source = ws;
+  sourceBytesReceived = 0;
+  sourceByteRateWindowStartedAt = Date.now();
   console.log("source connected");
 
   ws.on("message", (data, isBinary) => {
     if (!isBinary) {
       return;
     }
+
+    sourceBytesReceived += rawDataByteLength(data);
 
     for (const dest of destinations) {
       if (dest.readyState === WebSocket.OPEN) {
