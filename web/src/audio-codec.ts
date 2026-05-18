@@ -1,5 +1,8 @@
 const MU_LAW_BIAS = 0x84;
 const MU_LAW_CLIP = 32635;
+const DOWNSAMPLE_FACTOR = 3;
+
+export const MU_LAW_SAMPLE_RATE = 16000;
 
 function pcm16SampleToMuLaw(sample: number) {
   const sign = (sample >> 8) & 0x80;
@@ -35,13 +38,22 @@ function muLawSampleToPcm16(muLawSample: number) {
   return sign === 0 ? sample : -sample;
 }
 
-export function encodePcm16ToMuLaw(data: ArrayBuffer) {
+export function encodePcm16ToMuLaw16Khz(data: ArrayBuffer) {
   const pcm16 = new Int16Array(data);
-  const encodedBuffer = new ArrayBuffer(pcm16.length);
+  const encodedSampleCount = Math.floor(pcm16.length / DOWNSAMPLE_FACTOR);
+  const encodedBuffer = new ArrayBuffer(encodedSampleCount);
   const encoded = new Uint8Array(encodedBuffer);
 
-  for (let i = 0; i < pcm16.length; i++) {
-    encoded[i] = pcm16SampleToMuLaw(pcm16[i]);
+  for (let i = 0; i < encoded.length; i++) {
+    const sourceIndex = i * DOWNSAMPLE_FACTOR;
+    const downsampled = Math.trunc(
+      (pcm16[sourceIndex] +
+        pcm16[sourceIndex + 1] +
+        pcm16[sourceIndex + 2]) /
+        DOWNSAMPLE_FACTOR,
+    );
+
+    encoded[i] = pcm16SampleToMuLaw(downsampled);
   }
 
   return encodedBuffer;

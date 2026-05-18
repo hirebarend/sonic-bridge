@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { encodePcm16ToMuLaw } from "./audio-codec";
+import { encodePcm16ToMuLaw16Khz } from "./audio-codec";
 import { createAudioContext } from "./utils";
 import { useWakeLock } from "./use-wake-lock";
 import { useWebSocket } from "./use-web-socket";
@@ -99,7 +99,7 @@ function Source() {
           return;
         }
 
-        if (!send(encodePcm16ToMuLaw(e.data))) {
+        if (!send(encodePcm16ToMuLaw16Khz(e.data))) {
           return;
         }
       };

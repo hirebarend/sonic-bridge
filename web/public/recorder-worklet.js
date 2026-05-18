@@ -1,6 +1,6 @@
 // Buffers Float32 input into Int16 PCM chunks and posts them via transferable ArrayBuffer.
-// Source encodes each posted PCM chunk to 8-bit mu-law before sending it.
-// Chunk size is 2400 samples = 50 ms at 48 kHz mono. Both sides assume that fixed rate.
+// Source downsamples each posted PCM chunk to 16 kHz, then encodes it to 8-bit mu-law.
+// Chunk size is 2400 samples = 50 ms at 48 kHz mono.
 
 const CHUNK_SAMPLES = 2400;
 
