@@ -1,3 +1,5 @@
+import { decodeMuLawToFloat32 } from "./audio-codec";
+
 type WindowWithWebkitAudioContext = Window &
   typeof globalThis & {
     webkitAudioContext?: typeof AudioContext;
@@ -30,26 +32,12 @@ export async function createAudioContext(): Promise<AudioContext> {
   return audioCtx;
 }
 
-export function pcm16ToFloat32(
-  data: ArrayBuffer,
-): Float32Array<ArrayBufferLike> {
-  const int16 = new Int16Array(data);
-  const float32 = new Float32Array(int16.length);
-
-  for (let i = 0; i < int16.length; i++) {
-    const value = int16[i];
-    float32[i] = value < 0 ? value / 0x8000 : value / 0x7fff;
-  }
-
-  return float32;
-}
-
 export function scheduleChunk(
   audioCtx: AudioContext,
   data: ArrayBuffer,
   nextStartTime: number,
 ) {
-  const float32 = pcm16ToFloat32(data);
+  const float32 = decodeMuLawToFloat32(data);
   const buffer = audioCtx.createBuffer(1, float32.length, SAMPLE_RATE);
   buffer.getChannelData(0).set(float32);
 

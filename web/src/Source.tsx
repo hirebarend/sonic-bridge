@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { encodePcm16ToMuLaw } from "./audio-codec";
 import { createAudioContext } from "./utils";
 import { useWakeLock } from "./use-wake-lock";
 import { useWebSocket } from "./use-web-socket";
@@ -98,7 +99,7 @@ function Source() {
           return;
         }
 
-        if (!send(e.data)) {
+        if (!send(encodePcm16ToMuLaw(e.data))) {
           return;
         }
       };
