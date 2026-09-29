@@ -1,6 +1,5 @@
 # Go
-server/bin/
-server/dist/
+bin/
 *.test
 *.out
 coverage.txt
@@ -15,15 +14,13 @@ esp32/compile_commands.json
 esp32/sdkconfig
 esp32/sdkconfig.old
 
-# CMake / C++
-console/build/
-console/cmake-build-*/
-*.o
-*.obj
-*.exe
-*.dSYM/
+# Secrets. WiFi credentials and the relay address live here, never in source.
+esp32/secrets.ini
+.env
+.env.*
+!.env.example
 
-# Editor / OS
+# Editor and OS
 .DS_Store
 .idea/
 .vscode/

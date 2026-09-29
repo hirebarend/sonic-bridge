@@ -1,0 +1,10 @@
+.git/
+.github/
+bin/
+esp32/
+scripts/
+Makefile
+README.md
+*.md
+compose*.yaml
+.env*

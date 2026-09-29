@@ -1,30 +1,36 @@
-// sonic-bridge ESP32-C3 firmware.
+// sonic-bridge ESP32-C3 firmware: an audio source.
 //
-// Captures audio from an INMP441 I2S MEMS microphone, downshifts the 24-bit
-// samples to 16-bit, and streams the raw PCM over TCP to the sonic-bridge
-// server on SONIC_SERVER_HOST:SONIC_SERVER_PORT.
+// It runs the same three stages as the console and the browser source, in the
+// same order:
 //
-// Architecture:
-//   I2S reader task --(ring buffer)--> TCP sender task --> server
-// The two tasks are decoupled so that a slow / blocked TCP write can never
-// stall i2s_channel_read(), which would otherwise overrun the I2S DMA and
-// drop samples.
+//   capture   an I2S task reads the microphone and shifts 32-bit slots to int16
+//   encode    sonic::encodeFrame turns samples into wire bytes
+//   transmit  a TCP task sends the stream header once, then frames
 //
-// Wire format (must match server + console):
-//   16 kHz, 16-bit signed LE PCM, mono, raw byte stream.
+// One deliberate difference: encoding happens before the buffer that separates
+// the two tasks, not after it. RAM is the scarce resource here, so compressing
+// first doubles the jitter tolerance the same buffer gives. The console and the
+// browser encode after their buffer, where memory is free.
+//
+// The two tasks are decoupled so that a blocked TCP write can never stall
+// i2s_channel_read, which would overrun the I2S DMA and corrupt the capture.
+// When the ring fills, the newest frame is dropped rather than the capture
+// being held up, which is the same policy internal/queue applies in Go.
+//
+// Configuration comes from build flags, set in secrets.ini. Copy
+// secrets.ini.example and fill it in; the real file is not tracked by git.
 //
 // INMP441 wiring (mic pin -> ESP32-C3 GPIO):
 //   VDD -> 3V3
 //   GND -> GND
-//   L/R -> GND          (selects the left I2S slot)
-//   SCK -> SONIC_I2S_SCK    (default GPIO 4)
-//   WS  -> SONIC_I2S_WS     (default GPIO 5)
-//   SD  -> SONIC_I2S_SD     (default GPIO 6)
+//   L/R -> GND          selects the left I2S slot
+//   SCK -> SONIC_I2S_SCK    default GPIO 4
+//   WS  -> SONIC_I2S_WS     default GPIO 5
+//   SD  -> SONIC_I2S_SD     default GPIO 6
 //
-// Pin notes (ESP32-C3-DevKitM-1):
-//   - GPIO 4/5/6 are safe general-purpose pins. Other free choices: 7, 8, 10.
-//   - Avoid GPIO 11-17 (SPI flash), 18-19 (USB-JTAG on most modules),
-//     20-21 (UART0 used by Serial), and the strapping pins 2/8/9.
+// Pin notes (ESP32-C3-DevKitM-1): GPIO 4/5/6 are safe general-purpose pins,
+// and 7, 8 and 10 are also free. Avoid 11-17 (SPI flash), 18-19 (USB-JTAG on
+// most modules), 20-21 (UART0 used by Serial) and the strapping pins 2/8/9.
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -34,242 +40,349 @@
 #include "driver/i2s_std.h"
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "freertos/ringbuf.h"
+#include "freertos/task.h"
 
-// === Edit these before flashing. ===
-#define SONIC_WIFI_SSID     "WR7010-2.4G-82E"
-#define SONIC_WIFI_PASS     "12345678"
-#define SONIC_SERVER_HOST   "167.99.254.104"
-#define SONIC_SERVER_PORT   9000
+#include "wire.h"
 
-// === Tunables. Edit if you change the wire format, mic shift, or pinout. ===
-#define SONIC_SAMPLE_RATE   8000
-#define SONIC_CHUNK_SAMPLES 1024
+#ifndef SONIC_WIFI_SSID
+#define SONIC_WIFI_SSID "set-wifi-ssid-in-secrets-ini"
+#endif
+#ifndef SONIC_WIFI_PASS
+#define SONIC_WIFI_PASS ""
+#endif
+#ifndef SONIC_RELAY_HOST
+#define SONIC_RELAY_HOST "192.168.1.10"
+#endif
+#ifndef SONIC_RELAY_PORT
+#define SONIC_RELAY_PORT 9000
+#endif
+
+// Wire format. The relay accepts whatever this declares, so these can change
+// without touching the server. mu-law is the only codec the relay accepts: it
+// halves the bandwidth of linear samples for a loss inaudible in speech.
+#ifndef SONIC_SAMPLE_RATE
+#define SONIC_SAMPLE_RATE 16000
+#endif
+#ifndef SONIC_FRAME_SAMPLES
+#define SONIC_FRAME_SAMPLES 320
+#endif
+
+// Microphone and pinout.
+#ifndef SONIC_INMP441_SHIFT
 #define SONIC_INMP441_SHIFT 14
-#define SONIC_I2S_SCK       4
-#define SONIC_I2S_WS        5
-#define SONIC_I2S_SD        6
+#endif
+#ifndef SONIC_I2S_SCK
+#define SONIC_I2S_SCK 4
+#endif
+#ifndef SONIC_I2S_WS
+#define SONIC_I2S_WS 5
+#endif
+#ifndef SONIC_I2S_SD
+#define SONIC_I2S_SD 6
+#endif
 
-// DMA: 8 descriptors x 512 frames = 4096 frames = 256 ms of headroom.
-#define SONIC_I2S_DMA_DESC_NUM   8
-#define SONIC_I2S_DMA_FRAME_NUM  512
+// DMA: 8 descriptors of 512 frames is 4096 frames, which is 256 ms at 16 kHz.
+#define SONIC_I2S_DMA_DESC_NUM 8
+#define SONIC_I2S_DMA_FRAME_NUM 512
 
-// Ring buffer between I2S task and TCP task. ~1 s of audio so a brief
-// network stall doesn't lose samples. 16000 samples/s * 2 bytes = 32 KB.
-#define SONIC_RING_BYTES         (SONIC_SAMPLE_RATE * 2)
+// TCP send buffer hint for lwIP. Larger trades RAM for jitter tolerance.
+#define SONIC_TCP_SNDBUF_BYTES (16 * 1024)
 
-// TCP send buffer hint for lwIP. Larger = more jitter tolerance.
-#define SONIC_TCP_SNDBUF_BYTES   (16 * 1024)
-
-// Short pause when the TCP connection has actually dropped and we need to
-// rebuild it. Not used for one-off write hiccups.
-#define SONIC_RECONNECT_MS       250
+// Pause before rebuilding a connection that actually dropped. It is not used
+// for a single failed write.
+#define SONIC_RECONNECT_MS 250
 
 namespace {
 
-constexpr int kSampleRate = SONIC_SAMPLE_RATE;
-constexpr int kChunkSamples = SONIC_CHUNK_SAMPLES;
-constexpr int kChunkBytes = kChunkSamples * 2;
-constexpr int kI2sSckPin = SONIC_I2S_SCK;
-constexpr int kI2sWsPin = SONIC_I2S_WS;
-constexpr int kI2sSdPin = SONIC_I2S_SD;
+constexpr uint32_t kSampleRate = SONIC_SAMPLE_RATE;
+constexpr uint16_t kFrameSamples = SONIC_FRAME_SAMPLES;
+constexpr size_t kFrameBytes = kFrameSamples;
 constexpr int kInmpShift = SONIC_INMP441_SHIFT;
-constexpr uint32_t kReconnectMs = SONIC_RECONNECT_MS;
 
-i2s_chan_handle_t g_rx = nullptr;
-RingbufHandle_t g_ring = nullptr;
-WiFiClient g_client;
+// RINGBUF_TYPE_NOSPLIT stores an 8-byte header per item and aligns items to
+// four bytes, so the usable capacity is well below the raw byte count. Sizing
+// from the real per-item cost is what makes "one second" true rather than
+// aspirational.
+constexpr size_t kRingItemOverhead = 8;
+constexpr size_t kRingItemBytes = ((kFrameBytes + 3) & ~static_cast<size_t>(3)) + kRingItemOverhead;
+constexpr size_t kRingFrames = kSampleRate / kFrameSamples;
+constexpr size_t kRingBytes = kRingFrames * kRingItemBytes;
 
-// Per-task scratch. Owned by the I2S task only.
-int32_t g_i2s_buf[kChunkSamples];
-int16_t g_send_buf[kChunkSamples];
+constexpr uint32_t kStatusIntervalMs = 5000;
 
-bool setupI2s() {
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = SONIC_I2S_DMA_DESC_NUM;
-    chan_cfg.dma_frame_num = SONIC_I2S_DMA_FRAME_NUM;
+i2s_chan_handle_t g_capture = nullptr;
+RingbufHandle_t g_frames = nullptr;
+WiFiClient g_relay;
 
-    if (i2s_new_channel(&chan_cfg, nullptr, &g_rx) != ESP_OK) {
+// Scratch buffers owned by the capture task alone.
+int32_t g_slotBuffer[kFrameSamples];
+int16_t g_sampleBuffer[kFrameSamples];
+uint8_t g_frameBuffer[kFrameSamples];
+
+volatile uint32_t g_droppedFrames = 0;
+volatile uint32_t g_sentFrames = 0;
+volatile int16_t g_peakSample = 0;
+
+bool startCapture() {
+    i2s_chan_config_t channelConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    channelConfig.dma_desc_num = SONIC_I2S_DMA_DESC_NUM;
+    channelConfig.dma_frame_num = SONIC_I2S_DMA_FRAME_NUM;
+
+    if (i2s_new_channel(&channelConfig, nullptr, &g_capture) != ESP_OK) {
         Serial.println("i2s_new_channel failed");
         return false;
     }
 
-    // We avoid the ESP-IDF helper macros (I2S_STD_CLK_DEFAULT_CONFIG etc.)
-    // because their designated-initializer order does not match struct
-    // declaration order for ESP32-C6, which is a hard error in C++.
-    i2s_std_config_t std_cfg = {};
+    // The ESP-IDF helper macros are avoided here because their
+    // designated-initialiser order does not match struct declaration order on
+    // every RISC-V target, which is a hard error in C++.
+    i2s_std_config_t standardConfig = {};
 
-    std_cfg.clk_cfg.sample_rate_hz = kSampleRate;
-    std_cfg.clk_cfg.clk_src = I2S_CLK_SRC_DEFAULT;
-    std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+    standardConfig.clk_cfg.sample_rate_hz = kSampleRate;
+    standardConfig.clk_cfg.clk_src = I2S_CLK_SRC_DEFAULT;
+    standardConfig.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
 
-    std_cfg.slot_cfg.data_bit_width = I2S_DATA_BIT_WIDTH_32BIT;
-    std_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO;
-    std_cfg.slot_cfg.slot_mode = I2S_SLOT_MODE_MONO;
-    // INMP441 L/R pin tied to GND -> data lands in the left slot.
-    std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
-    std_cfg.slot_cfg.ws_width = I2S_DATA_BIT_WIDTH_32BIT;
-    std_cfg.slot_cfg.ws_pol = false;
-    std_cfg.slot_cfg.bit_shift = true;
-    std_cfg.slot_cfg.left_align = true;
-    std_cfg.slot_cfg.big_endian = false;
-    std_cfg.slot_cfg.bit_order_lsb = false;
+    standardConfig.slot_cfg.data_bit_width = I2S_DATA_BIT_WIDTH_32BIT;
+    standardConfig.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO;
+    standardConfig.slot_cfg.slot_mode = I2S_SLOT_MODE_MONO;
+    standardConfig.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+    standardConfig.slot_cfg.ws_width = I2S_DATA_BIT_WIDTH_32BIT;
+    standardConfig.slot_cfg.ws_pol = false;
+    standardConfig.slot_cfg.bit_shift = true;
+    standardConfig.slot_cfg.left_align = true;
+    standardConfig.slot_cfg.big_endian = false;
+    standardConfig.slot_cfg.bit_order_lsb = false;
 
-    std_cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED;
-    std_cfg.gpio_cfg.bclk = static_cast<gpio_num_t>(kI2sSckPin);
-    std_cfg.gpio_cfg.ws   = static_cast<gpio_num_t>(kI2sWsPin);
-    std_cfg.gpio_cfg.dout = I2S_GPIO_UNUSED;
-    std_cfg.gpio_cfg.din  = static_cast<gpio_num_t>(kI2sSdPin);
+    standardConfig.gpio_cfg.mclk = I2S_GPIO_UNUSED;
+    standardConfig.gpio_cfg.bclk = static_cast<gpio_num_t>(SONIC_I2S_SCK);
+    standardConfig.gpio_cfg.ws = static_cast<gpio_num_t>(SONIC_I2S_WS);
+    standardConfig.gpio_cfg.dout = I2S_GPIO_UNUSED;
+    standardConfig.gpio_cfg.din = static_cast<gpio_num_t>(SONIC_I2S_SD);
 
-    if (i2s_channel_init_std_mode(g_rx, &std_cfg) != ESP_OK) {
+    if (i2s_channel_init_std_mode(g_capture, &standardConfig) != ESP_OK) {
         Serial.println("i2s_channel_init_std_mode failed");
         return false;
     }
-    if (i2s_channel_enable(g_rx) != ESP_OK) {
+
+    if (i2s_channel_enable(g_capture) != ESP_OK) {
         Serial.println("i2s_channel_enable failed");
         return false;
     }
+
     return true;
 }
 
-void ensureWiFi() {
-    if (WiFi.status() == WL_CONNECTED) return;
-    Serial.printf("connecting WiFi: %s\n", SONIC_WIFI_SSID);
+// shiftSlotsToSamples converts the microphone's 24-bit samples, which arrive
+// MSB-aligned in a 32-bit slot, to the linear 16-bit samples every codec
+// works with. Tune the shift with SONIC_INMP441_SHIFT.
+void shiftSlotsToSamples(const int32_t* slots, size_t sampleCount, int16_t* samples) {
+    int16_t peak = 0;
+
+    for (size_t i = 0; i < sampleCount; ++i) {
+        int32_t value = slots[i] >> kInmpShift;
+
+        if (value > INT16_MAX) {
+            value = INT16_MAX;
+        }
+
+        if (value < INT16_MIN) {
+            value = INT16_MIN;
+        }
+
+        samples[i] = static_cast<int16_t>(value);
+
+        const int16_t magnitude = static_cast<int16_t>(value < 0 ? -(value + 1) : value);
+        if (magnitude > peak) {
+            peak = magnitude;
+        }
+    }
+
+    g_peakSample = peak;
+}
+
+void discardBufferedFrames() {
+    size_t itemBytes = 0;
+
+    for (void* item = xRingbufferReceive(g_frames, &itemBytes, 0); item != nullptr;
+         item = xRingbufferReceive(g_frames, &itemBytes, 0)) {
+        vRingbufferReturnItem(g_frames, item);
+    }
+}
+
+bool writeAll(const uint8_t* payload, size_t payloadBytes) {
+    size_t remaining = payloadBytes;
+
+    while (remaining > 0) {
+        const int written = g_relay.write(payload, remaining);
+
+        if (written <= 0) {
+            return false;
+        }
+
+        payload += written;
+        remaining -= static_cast<size_t>(written);
+    }
+
+    return true;
+}
+
+bool ensureNetwork() {
+    if (WiFi.status() == WL_CONNECTED) {
+        return true;
+    }
+
+    Serial.printf("connecting to WiFi: %s\n", SONIC_WIFI_SSID);
     WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false); // lower latency / fewer bursty stalls at the cost of power
+    // Lower latency and fewer bursty stalls, at the cost of power.
+    WiFi.setSleep(false);
     WiFi.begin(SONIC_WIFI_SSID, SONIC_WIFI_PASS);
-    uint32_t deadline = millis() + 20000;
+
+    const uint32_t deadline = millis() + 20000;
     while (WiFi.status() != WL_CONNECTED && millis() < deadline) {
         delay(200);
     }
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("WiFi up, IP=%s, RSSI=%d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
-    } else {
-        Serial.println("WiFi failed; will retry");
-    }
-}
 
-bool ensureServer() {
-    if (g_client.connected()) return true;
-    Serial.printf("dialing server %s:%d\n", SONIC_SERVER_HOST, SONIC_SERVER_PORT);
-    if (!g_client.connect(SONIC_SERVER_HOST, SONIC_SERVER_PORT)) {
-        Serial.println("server connect failed");
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi failed, will retry");
         return false;
     }
-    g_client.setNoDelay(true);
-    int fd = g_client.fd();
-    if (fd >= 0) {
-        int sndbuf = SONIC_TCP_SNDBUF_BYTES;
-        ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-    }
-    Serial.println("server connected");
+
+    Serial.printf("WiFi up, ip=%s rssi=%d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+
     return true;
 }
 
-// I2S reader task: blocks on i2s_channel_read, converts 32-bit slots to S16LE,
-// and pushes converted bytes into g_ring. Never touches WiFi or TCP.
-void i2sTask(void*) {
+// ensureRelay dials the relay and declares the wire format. Frames captured
+// while the link was down are discarded here, so a reconnect resumes live
+// instead of replaying a backlog.
+bool ensureRelay() {
+    if (g_relay.connected()) {
+        return true;
+    }
+
+    Serial.printf("dialling relay %s:%d\n", SONIC_RELAY_HOST, SONIC_RELAY_PORT);
+
+    if (!g_relay.connect(SONIC_RELAY_HOST, SONIC_RELAY_PORT)) {
+        Serial.println("relay connect failed");
+        return false;
+    }
+
+    g_relay.setNoDelay(true);
+
+    const int socketHandle = g_relay.fd();
+    if (socketHandle >= 0) {
+        int sendBufferBytes = SONIC_TCP_SNDBUF_BYTES;
+        ::setsockopt(socketHandle, SOL_SOCKET, SO_SNDBUF, &sendBufferBytes, sizeof(sendBufferBytes));
+    }
+
+    uint8_t header[sonic::kHeaderBytes];
+    const size_t headerBytes = sonic::buildStreamHeader(header, sonic::kCodecMulaw, kSampleRate, kFrameSamples);
+
+    if (!writeAll(header, headerBytes)) {
+        Serial.println("could not send the stream header");
+        g_relay.stop();
+        return false;
+    }
+
+    discardBufferedFrames();
+    Serial.printf("relay connected, streaming mulaw at %u Hz, %u samples per frame\n",
+                  static_cast<unsigned>(kSampleRate),
+                  static_cast<unsigned>(kFrameSamples));
+
+    return true;
+}
+
+void captureTask(void*) {
     for (;;) {
-        size_t bytes_read = 0;
-        esp_err_t r = i2s_channel_read(g_rx, g_i2s_buf, sizeof(g_i2s_buf), &bytes_read, portMAX_DELAY);
-        if (r != ESP_OK) {
-            Serial.printf("i2s read error: %d\n", r);
+        size_t bytesRead = 0;
+        const esp_err_t status =
+            i2s_channel_read(g_capture, g_slotBuffer, sizeof(g_slotBuffer), &bytesRead, portMAX_DELAY);
+
+        if (status != ESP_OK) {
+            Serial.printf("i2s read error: %d\n", status);
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
-        size_t samples = bytes_read / sizeof(int32_t);
-        for (size_t i = 0; i < samples; ++i) {
-            // INMP441 samples are 24-bit, MSB-aligned in the upper 24 bits of a
-            // 32-bit slot. Right-shifting by 14 places the audio range into a
-            // ~16-bit signed window with some headroom (tune via SONIC_INMP441_SHIFT).
-            int32_t v = g_i2s_buf[i] >> kInmpShift;
-            if (v > INT16_MAX) v = INT16_MAX;
-            if (v < INT16_MIN) v = INT16_MIN;
-            g_send_buf[i] = static_cast<int16_t>(v);
-        }
-        size_t bytes_to_send = samples * sizeof(int16_t);
-        // Non-blocking send into the ring. If the ring is full the network task
-        // is wedged; drop this chunk rather than block I2S.
-        if (xRingbufferSend(g_ring, g_send_buf, bytes_to_send, 0) != pdTRUE) {
-            static uint32_t s_drops = 0;
-            if ((++s_drops % 16) == 1) {
-                Serial.printf("ring full, dropping chunk (%u so far)\n", s_drops);
-            }
+
+        const size_t sampleCount = bytesRead / sizeof(int32_t);
+        shiftSlotsToSamples(g_slotBuffer, sampleCount, g_sampleBuffer);
+
+        const size_t frameBytes = sonic::encodeFrame(g_sampleBuffer, sampleCount, g_frameBuffer);
+
+        if (xRingbufferSend(g_frames, g_frameBuffer, frameBytes, 0) != pdTRUE) {
+            ++g_droppedFrames;
         }
     }
 }
 
-// TCP sender task: ensures WiFi + server, then drains the ring into the socket.
-// Blocking writes here cannot affect the I2S read cadence.
-void tcpTask(void*) {
+void transmitTask(void*) {
     for (;;) {
-        ensureWiFi();
-        if (WiFi.status() != WL_CONNECTED) {
-            vTaskDelay(pdMS_TO_TICKS(kReconnectMs));
-            continue;
-        }
-        if (!ensureServer()) {
-            vTaskDelay(pdMS_TO_TICKS(kReconnectMs));
+        if (!ensureNetwork() || !ensureRelay()) {
+            vTaskDelay(pdMS_TO_TICKS(SONIC_RECONNECT_MS));
             continue;
         }
 
-        size_t item_size = 0;
-        // Wait up to 100 ms for a chunk; lets us re-check WiFi/server liveness.
-        void* item = xRingbufferReceive(g_ring, &item_size, pdMS_TO_TICKS(100));
-        if (item == nullptr) continue;
+        size_t itemBytes = 0;
+        // A bounded wait lets the loop recheck WiFi and relay liveness.
+        void* item = xRingbufferReceive(g_frames, &itemBytes, pdMS_TO_TICKS(100));
 
-        const uint8_t* p = static_cast<const uint8_t*>(item);
-        size_t remaining = item_size;
-        bool ok = true;
-        while (remaining > 0) {
-            int n = g_client.write(p, remaining);
-            if (n <= 0) {
-                Serial.println("tcp write failed; reconnecting");
-                g_client.stop();
-                ok = false;
-                break;
-            }
-            p += n;
-            remaining -= static_cast<size_t>(n);
+        if (item == nullptr) {
+            continue;
         }
-        vRingbufferReturnItem(g_ring, item);
 
-        if (!ok) {
-            // Drain stale audio so we don't dump a backlog on the next connect.
-            while ((item = xRingbufferReceive(g_ring, &item_size, 0)) != nullptr) {
-                vRingbufferReturnItem(g_ring, item);
-            }
-            vTaskDelay(pdMS_TO_TICKS(kReconnectMs));
+        const bool sent = writeAll(static_cast<const uint8_t*>(item), itemBytes);
+        vRingbufferReturnItem(g_frames, item);
+
+        if (sent) {
+            ++g_sentFrames;
+            continue;
         }
+
+        Serial.println("relay write failed, reconnecting");
+        g_relay.stop();
+        discardBufferedFrames();
+        vTaskDelay(pdMS_TO_TICKS(SONIC_RECONNECT_MS));
     }
 }
 
-} // namespace
+}  // namespace
 
 void setup() {
     Serial.begin(115200);
     delay(200);
-    Serial.println("\nsonic-bridge esp32 starting");
+    Serial.println("\nsonic-bridge esp32 source starting");
 
-    if (!setupI2s()) {
-        Serial.println("FATAL: I2S setup failed; halting");
-        while (true) delay(1000);
+    if (!startCapture()) {
+        Serial.println("FATAL: I2S setup failed, halting");
+        while (true) {
+            delay(1000);
+        }
     }
 
-    g_ring = xRingbufferCreate(SONIC_RING_BYTES, RINGBUF_TYPE_NOSPLIT);
-    if (g_ring == nullptr) {
-        Serial.println("FATAL: xRingbufferCreate failed; halting");
-        while (true) delay(1000);
+    g_frames = xRingbufferCreate(kRingBytes, RINGBUF_TYPE_NOSPLIT);
+    if (g_frames == nullptr) {
+        Serial.println("FATAL: xRingbufferCreate failed, halting");
+        while (true) {
+            delay(1000);
+        }
     }
 
-    // I2S task: high priority, small stack. Must never be starved.
-    xTaskCreatePinnedToCore(i2sTask, "i2s",   4096, nullptr, 10, nullptr, tskNO_AFFINITY);
-    // TCP task: lower priority. Owns WiFi/TCP and may block.
-    xTaskCreatePinnedToCore(tcpTask, "tcp",   8192, nullptr,  5, nullptr, tskNO_AFFINITY);
+    Serial.printf("frame buffer holds %u frames (%u bytes, about one second)\n",
+                  static_cast<unsigned>(kRingFrames), static_cast<unsigned>(kRingBytes));
+
+    // Capture runs at a high priority with a small stack: it must never be
+    // starved. Transmit owns WiFi and TCP and is allowed to block.
+    xTaskCreatePinnedToCore(captureTask, "capture", 4096, nullptr, 10, nullptr, tskNO_AFFINITY);
+    xTaskCreatePinnedToCore(transmitTask, "transmit", 8192, nullptr, 5, nullptr, tskNO_AFFINITY);
 }
 
 void loop() {
-    // All work happens in the two tasks above. Nothing to do here.
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    delay(kStatusIntervalMs);
+
+    Serial.printf("streaming frames=%u dropped=%u peak=%d rssi=%d\n",
+                  static_cast<unsigned>(g_sentFrames),
+                  static_cast<unsigned>(g_droppedFrames),
+                  static_cast<int>(g_peakSample),
+                  WiFi.RSSI());
 }

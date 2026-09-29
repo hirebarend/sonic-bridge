@@ -1,0 +1,161 @@
+name: sonic-bridge
+
+services:
+  traefik:
+    image: traefik:v3.7.1
+    restart: unless-stopped
+    command:
+      - --api.dashboard=false
+      - --ping=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL:-admin@example.com}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge=true
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_certs:/letsencrypt
+    networks:
+      - edge
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      relay:
+        condition: service_healthy
+
+  relay:
+    image: ${RELAY_IMAGE:-ghcr.io/hirebarend/sonic-bridge}:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    command:
+      - --http-addr=:8080
+      - --tcp-source-addr=:9000
+    # Sources speak plain TCP, so this port is published directly rather than
+    # routed through Traefik. It is the relay's ONLY ingest path: both the
+    # firmware and the console use it, and neither has TLS. Anyone who can
+    # reach it can publish to the stream, so firewall it to the addresses your
+    # sources use, or reach it through an SSH tunnel.
+    ports:
+      - "${TCP_SOURCE_PORT:-9000}:9000"
+    networks:
+      - edge
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/server", "--http-addr=:8080", "--health-check"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=sonic-bridge_edge
+      - "traefik.http.routers.sonic-bridge.rule=Host(`${DOMAIN:-sonic.example.com}`)"
+      - traefik.http.routers.sonic-bridge.entrypoints=websecure
+      - traefik.http.routers.sonic-bridge.tls=true
+      - traefik.http.routers.sonic-bridge.tls.certresolver=letsencrypt
+      - traefik.http.services.sonic-bridge.loadbalancer.server.port=8080
+      # Audio is a live stream, so no buffering and a long read timeout. A
+      # WebSocket or an endless WAV response must not be cut off mid-stream.
+      - traefik.http.services.sonic-bridge.loadbalancer.responseforwarding.flushinterval=10ms
+
+  # Keeps the relay on the newest published image without a manual redeploy by
+  # running the same two commands an operator would: `compose pull`, then
+  # `compose up -d`. Traefik is deliberately absent: its version is pinned
+  # above and moves only when an operator says so.
+  updater:
+    image: docker:28-cli
+    restart: unless-stopped
+    environment:
+      # Seconds between checks. Set to 0 to park the updater without removing it.
+      UPDATE_INTERVAL: ${UPDATE_INTERVAL:-300}
+    volumes:
+      # Root-equivalent access to the host, required to recreate containers.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # A relative source resolves against the Compose project directory, so
+      # this mounts whichever directory holds compose.yaml and .env.
+      - .:/stack:ro
+    # The daemon performs the image transfer, so this container needs no network.
+    network_mode: none
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    entrypoint: ["/bin/sh", "-eu", "-c"]
+    command:
+      - |
+        COMPOSE="docker compose --project-directory /stack --env-file /stack/.env"
+
+        # The relay is stale when the tag it was created from now resolves to a
+        # different image than the one it is running.
+        stale() {
+          id=$$($$COMPOSE ps -q relay 2>/dev/null) || return 0
+          [ -n "$$id" ] || return 0
+          running=$$(docker inspect -f '{{.Image}}' "$$id" 2>/dev/null) || return 0
+          tag=$$(docker inspect -f '{{.Config.Image}}' "$$id" 2>/dev/null) || return 0
+          published=$$(docker image inspect -f '{{.Id}}' "$$tag" 2>/dev/null) || return 0
+          [ "$$running" = "$$published" ] && return 1
+          return 0
+        }
+
+        case "$$UPDATE_INTERVAL" in
+          ''|*[!0-9]*)
+            echo "updater: UPDATE_INTERVAL must be a whole number of seconds" >&2
+            while :; do sleep 86400; done
+            ;;
+        esac
+
+        if [ "$$UPDATE_INTERVAL" -eq 0 ]; then
+          echo "updater: UPDATE_INTERVAL=0, auto-update is off"
+          while :; do sleep 86400; done
+        fi
+
+        echo "updater: checking the relay every $${UPDATE_INTERVAL}s"
+
+        # Sleep first: on a fresh deploy the outer `up -d --wait` is still
+        # running, and two Compose processes must not write the project at once.
+        while :; do
+          sleep "$$UPDATE_INTERVAL"
+
+          if ! timeout 600 $$COMPOSE pull --quiet relay; then
+            echo "updater: pull failed, stack left untouched" >&2
+            continue
+          fi
+
+          stale || continue
+
+          echo "updater: new image published, recreating the relay"
+          if timeout 300 $$COMPOSE up -d --no-deps --wait --wait-timeout 180 relay; then
+            echo "updater: done"
+            # Dangling images only, so the pinned Traefik image is never touched.
+            docker image prune -f >/dev/null 2>&1 || true
+          else
+            echo "updater: recreate did not report healthy, check 'docker compose logs relay'" >&2
+          fi
+        done
+
+networks:
+  edge:
+
+volumes:
+  traefik_certs:

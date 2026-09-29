@@ -1,0 +1,103 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Node is needed only to run the browser decoder in the wire check.
+      # There is no web build.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l cmd internal)"
+          if [[ -n "$unformatted" ]]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race ./...
+
+      # The only build that compiles internal/source's !cgo variant, because
+      # -race requires cgo and so `go test` can never reach it.
+      - name: Build without cgo
+        run: CGO_ENABLED=0 go build ./...
+
+      # The player has no type checker any more, so this is the only thing
+      # standing between a syntax error and a listener discovering it.
+      - name: Check the player scripts parse
+        run: |
+          node --check internal/relay/web/codec.js
+          node --check internal/relay/web/playback-processor.js
+
+      # Proves the firmware encodes what the relay encodes, and the browser
+      # decodes what the relay decodes. Drift here is silent noise, not an error.
+      - name: Check the wire format across implementations
+        run: ./scripts/check-wire-format.sh
+
+  publish:
+    needs: verify
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `latest` tracks main so the deployed updater rolls onto each push.
+      # `sha-<commit>` never moves, which is what pinning and rollback use.
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+            type=semver,pattern={{version}}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

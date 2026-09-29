@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0b0b0f" />
+    <meta name="description" content="Live audio bridge: listen to whatever source is publishing." />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <title>sonic-bridge</title>
+    <style>
+      html {
+        -webkit-text-size-adjust: 100%;
+        background: #0b0b0f;
+      }
+
+      body {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 1.5rem;
+        min-height: 100dvh;
+        margin: 0;
+        padding: max(1.5rem, env(safe-area-inset-top)) 1rem max(1.5rem, env(safe-area-inset-bottom));
+        background: #0b0b0f;
+        color: #f2f2f5;
+        font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 1rem;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+      }
+
+      button {
+        width: 9rem;
+        height: 9rem;
+        border: 1px solid #2a2a37;
+        border-radius: 50%;
+        background: #14141b;
+        color: #f2f2f5;
+        font: 600 0.9375rem/1 inherit;
+        cursor: pointer;
+        transition: transform 0.15s, background-color 0.15s;
+        -webkit-tap-highlight-color: transparent;
+        touch-action: manipulation;
+      }
+
+      button:active {
+        transform: scale(0.96);
+      }
+
+      button[data-listening="true"] {
+        border-color: transparent;
+        background: #34d399;
+        color: #0b0b0f;
+      }
+
+      p {
+        margin: 0;
+        min-height: 1.5rem;
+        color: #8c8c9e;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>sonic-bridge</h1>
+    <button id="listen" type="button" data-listening="false">Listen</button>
+    <p id="status">Idle</p>
+    <audio id="sink" playsinline hidden></audio>
+
+    <script type="module">
+      import { decodeMulaw, toFloat32 } from "./codec.js";
+
+      // The jitter buffer absorbs network variation before playback starts.
+      const RING_MILLISECONDS = 1000;
+      const PREFILL_MILLISECONDS = 120;
+
+      // The relay has no source until one connects, so opening the page first
+      // is normal rather than an error. Back off and keep trying.
+      const RECONNECT_BASE_MILLISECONDS = 500;
+      const RECONNECT_MAX_MILLISECONDS = 8000;
+
+      // Both sources send 16 kHz. The graph is built at this rate before the
+      // relay has announced anything, and rebuilt only if it disagrees.
+      const NOMINAL_SAMPLE_RATE = 16000;
+
+      const button = document.getElementById("listen");
+      const status = document.getElementById("status");
+      const sink = document.getElementById("sink");
+
+      let context = null;
+      let output = null;
+      let worklet = null;
+      let socket = null;
+      let format = null;
+      let listening = false;
+      let attempt = 0;
+      let retry = null;
+
+      function show(text) {
+        status.textContent = text;
+        button.textContent = listening ? "Stop" : "Listen";
+        button.dataset.listening = String(listening);
+      }
+
+      // Everything up to play() runs synchronously inside the click handler.
+      // Awaiting before it loses the user gesture on iOS, and the result is
+      // silence with no error.
+      async function openPlayback(sampleRate) {
+        context = new AudioContext({ sampleRate });
+        output = context.createMediaStreamDestination();
+        sink.srcObject = output.stream;
+        sink.play().catch(() => undefined);
+
+        await context.audioWorklet.addModule("./playback-processor.js");
+        await context.resume();
+
+        worklet = new AudioWorkletNode(context, "playback-processor", {
+          numberOfInputs: 0,
+          numberOfOutputs: 1,
+          outputChannelCount: [1],
+          processorOptions: {
+            ringSamples: Math.round((context.sampleRate * RING_MILLISECONDS) / 1000),
+            prefillSamples: Math.round((context.sampleRate * PREFILL_MILLISECONDS) / 1000),
+          },
+        });
+
+        worklet.connect(output);
+      }
+
+      async function closePlayback() {
+        worklet?.disconnect();
+        worklet = null;
+        output = null;
+
+        if (context !== null) {
+          await context.close();
+          context = null;
+        }
+      }
+
+      // A jitter buffer cannot resample, so a stream whose rate differs from
+      // the graph forces a rebuild. The page already has a gesture by now, so
+      // the new context starts running.
+      async function applyFormat(payload) {
+        let announced = null;
+
+        try {
+          announced = JSON.parse(payload);
+        } catch {
+          show("The relay sent an unreadable format");
+
+          return;
+        }
+
+        if (announced.codec !== "mulaw" || announced.channels !== 1) {
+          show(`Cannot play ${announced.codec} with ${announced.channels} channels`);
+
+          return;
+        }
+
+        format = announced;
+        attempt = 0;
+
+        if (context !== null && context.sampleRate !== format.sampleRate) {
+          await closePlayback();
+          await openPlayback(format.sampleRate);
+        }
+
+        show("Live");
+      }
+
+      function playFrame(payload) {
+        if (format === null || worklet === null) {
+          return;
+        }
+
+        const samples = toFloat32(decodeMulaw(new Uint8Array(payload)));
+        worklet.port.postMessage(samples, [samples.buffer]);
+      }
+
+      function openSocket() {
+        if (!listening) {
+          return;
+        }
+
+        const url = new URL("/listen", window.location.href);
+        url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+
+        socket = new WebSocket(url);
+        socket.binaryType = "arraybuffer";
+
+        socket.onmessage = (event) => {
+          if (typeof event.data === "string") {
+            applyFormat(event.data);
+
+            return;
+          }
+
+          playFrame(event.data);
+        };
+
+        socket.onclose = () => {
+          socket = null;
+
+          if (!listening) {
+            return;
+          }
+
+          const delay = Math.min(
+            RECONNECT_MAX_MILLISECONDS,
+            RECONNECT_BASE_MILLISECONDS * 2 ** attempt,
+          );
+          attempt += 1;
+          show("Waiting for a source");
+          retry = window.setTimeout(openSocket, delay);
+        };
+      }
+
+      function closeSocket() {
+        if (socket === null) {
+          return;
+        }
+
+        socket.onmessage = null;
+        socket.onclose = null;
+        socket.close();
+        socket = null;
+      }
+
+      async function start() {
+        if (listening) {
+          return;
+        }
+
+        listening = true;
+        attempt = 0;
+        show("Starting");
+
+        try {
+          await openPlayback(NOMINAL_SAMPLE_RATE);
+        } catch {
+          listening = false;
+          show("This browser cannot open an audio output");
+
+          return;
+        }
+
+        openSocket();
+      }
+
+      async function stop() {
+        listening = false;
+        window.clearTimeout(retry);
+        retry = null;
+        closeSocket();
+        await closePlayback();
+        format = null;
+        show("Idle");
+      }
+
+      button.addEventListener("click", () => {
+        if (listening) {
+          stop();
+
+          return;
+        }
+
+        start();
+      });
+
+      // Puts a title on the lock screen instead of a URL, and lets the
+      // operating system's media controls stop playback.
+      if ("mediaSession" in navigator) {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: "Live stream",
+          artist: "sonic-bridge",
+        });
+        navigator.mediaSession.setActionHandler("play", start);
+        navigator.mediaSession.setActionHandler("pause", stop);
+      }
+    </script>
+  </body>
+</html>
