@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"sonic-bridge/internal/stream"
@@ -30,8 +31,8 @@ const (
 	writeTimeout = 5 * time.Second
 
 	// sourceTimeout bounds the waits that depend on a source being alive: the
-	// gap between its frames, and how long a WAV request waits for the first
-	// frame before reporting that nothing is publishing.
+	// gap between audio/quiet records, and how long a WAV request waits for
+	// the first audio or quiet state before reporting no source.
 	sourceTimeout = 10 * time.Second
 )
 
@@ -47,9 +48,14 @@ type Config struct {
 
 // Relay owns the stream and the listeners that feed and drain it.
 type Relay struct {
-	config Config
-	log    *slog.Logger
-	stream *stream.Stream
+	config              Config
+	log                 *slog.Logger
+	stream              *stream.Stream
+	ingressAudioBytes   atomic.Uint64
+	ingressControlBytes atomic.Uint64
+	egressAudioBytes    atomic.Uint64
+	egressControlBytes  atomic.Uint64
+	wavBytes            atomic.Uint64
 
 	// sourceTimeout is a field rather than a bare constant only so tests can
 	// shorten it. Nothing in production changes it.

@@ -93,9 +93,64 @@ twenty years. That is a larger change: an MP3 encoder in the relay, encoded
 silence so the response never ends, and a burst of frames on connect to fill
 the player's pre-buffer.
 
+## Saving data during steady background sound
+
+Microphone sources listen continuously but transmit audio only while the sound
+is changing and for **30 seconds after the last detected change**. A new steady
+fan, hum, or running tap can become the suppressed background. The detector
+compares overall energy, transient peaks, and four broad frequency bands; it
+does not classify speech or remove noise from the audio you hear.
+
+Both sources retain **200 ms of lead-in**, so detection can include the beginning
+of a footstep or clatter. This adds 200 ms to the existing playback/network
+latency. The tone generator bypasses suppression and this delay.
+
+Once quiet, the source sends **one 9-byte state record every five seconds**
+(about **6.5 KB/hour** of application data). Browser listeners generate silence
+locally. TCP, TLS, WebSocket framing, acknowledgements, and WebSocket liveness
+pings add small overhead; this is near-zero audio traffic, not zero network
+traffic. While active, each 320-byte frame has a 9-byte record header: about
+59.2 MB/hour per source/browser leg before transport overhead.
+
+`/stream.wav` remains a compatibility endpoint: the relay synthesizes paced PCM
+silence, so WAV listeners still consume roughly **115.2 MB/hour** at 16 kHz.
+Use the browser for the data savings.
+
+```bash
+# Defaults: suppression enabled, 3 dB change threshold, 30-second settling.
+go run ./cmd/console --server 127.0.0.1:9000 --sensitivity-db 3 --settle 30s
+# More sensitive to quiet changes (potentially fewer savings):
+go run ./cmd/console --sensitivity-db 2
+# Continuous reference audio for calibration:
+go run ./cmd/console --suppression=false
+```
+
+Firmware equivalents are `SONIC_SUPPRESSION` (1), `SONIC_SENSITIVITY_DB` (3.0),
+and `SONIC_SETTLE_SECONDS` (30); add overrides under `build_flags` in
+`esp32/platformio.ini`. Existing `secrets.ini` files need no new entries.
+Sensitivity accepts 0.5–24 dB; settling accepts 1–600 seconds. The analysis uses
+100 ms energy smoothing, an immediate impact check, and an 8-PCM-unit analysis
+floor. Gain affects that floor; retain `--gain` / `SONIC_INMP441_SHIFT` for
+microphone calibration. Analysis filtering does not alter transmitted samples.
+
+Calibrate with the actual microphone: compare continuous and suppressed playback
+for distant footsteps, dishes, and recurring activity; leave the room stable for
+more than 30 seconds and check the byte counters. Lower the threshold if events
+are missed. Broad-band energy detection cannot guarantee detection of changes
+indistinguishable from the background. Synthetic tests are not a substitute for
+this listening check or an ESP32 runtime/CPU check. Locked-iPhone playback still
+needs the separate validation described above.
+
+Deploy the relay and browser first, reload existing browser sessions, then update
+the console/firmware. The new relay accepts legacy sources. New sources require
+the new relay. Old browser sessions are refused sparse streams rather than
+playing protocol headers as audio; reload to upgrade. No deployment or firmware
+flashing is part of `make check`.
+
 ## The wire format
 
-A stream is **mono, linear-PCM-derived audio in fixed-size frames**. The codec,
+A stream is **mono, linear-PCM-derived audio in fixed-size frames**, with explicit
+suppressed intervals in SB02. The codec,
 sample rate and frame size are declared by the source, so the relay and the
 destinations never guess.
 
@@ -117,26 +172,48 @@ any audio:
 
 | Offset | Size | Field         | Value                     |
 | ------ | ---- | ------------- | ------------------------- |
-| 0      | 4    | magic         | `SB01`                    |
+| 0      | 4    | magic         | `SB02` (new sources), `SB01` (legacy) |
 | 4      | 1    | codec id      | 1 = `mulaw`, the only value accepted |
 | 5      | 1    | channels      | 1                         |
 | 6      | 2    | frame samples | uint16, little-endian     |
 | 8      | 4    | sample rate   | uint32, little-endian     |
 
-Then frames back to back, each exactly `frameSamples` bytes, since mu-law is
-one byte per sample. There is no per-frame framing: the header fixes the size.
+SB01 carries frames back to back, each exactly `frameSamples` bytes.
+SB02 carries records with a fixed 9-byte header:
+
+| Offset | Size | Field |
+| ------ | ---- | ----- |
+| 0 | 1 | Kind: 1 = audio, 2 = quiet |
+| 1 | 8 | Capture sample position, uint64 little-endian |
+| 9 | `frameSamples` or 0 | μ-law payload for audio; no payload for quiet |
+
+Positions include suppressed samples, are frame-aligned, and strictly increase
+within a connection. The first position can be nonzero after reconnecting;
+positions are bounded below JavaScript's maximum exact integer. Quiet records
+mark the first omitted frame and periodically report the current position.
+They refresh the same ten-second liveness timeout as audio. Missing heartbeats
+release the source; intentional silence alone never does.
 
 The relay accepts one source at a time. A second source is closed immediately
 after its header.
 
 ### Delivery: the listener protocol
 
-A destination connects to `WS /listen` and receives a JSON text message
-whenever the format changes, then one binary message per frame:
+The updated player connects to `WS /listen?v=2` and receives a JSON text message
+when a source session starts, even if its format matches the previous session:
 
 ```json
-{ "codec": "mulaw", "sampleRate": 16000, "channels": 1, "frameSamples": 320 }
+{ "codec": "mulaw", "sampleRate": 16000, "channels": 1, "frameSamples": 320,
+  "epoch": 1, "sparse": true, "state": "quiet", "position": 480000 }
 ```
+
+`epoch` identifies the source session. `state` is `live` or `quiet`; a quiet join
+gets the latest state immediately. With `sparse: true`, each binary message is
+one complete SB02 record. With `sparse: false`, binary messages remain raw legacy
+μ-law frames. Source departure sends `{ "state": "waiting" }`. Each audio record
+implicitly restores `live`, so dropping an earlier state event cannot strand a
+listener in quiet mode. WebSocket pings every 20 seconds detect dead listeners;
+reading close/pong frames continues even when no source exists.
 
 The relay does not transcode on the live path: it forwards the source's bytes
 along with the format that describes them, and destinations decode. The one
@@ -153,8 +230,8 @@ being cosmetic: decode a mu-law frame as PCM and you get noise, not an error.
 overlap. Go is the hub, so it checks two pairs rather than one three-way match:
 
 ```
-  encode  Go   cc026405e617f1c15d1c71f9a9c2fe4575184c4a7032e1d83b52b6320e5cf9e1
-          C++  cc026405e617f1c15d1c71f9a9c2fe4575184c4a7032e1d83b52b6320e5cf9e1
+  encode  Go   78fd63052a48daf7ac02bffa8afd0adf8e35cd252d33fd0a219c8a2709efcd98
+          C++  78fd63052a48daf7ac02bffa8afd0adf8e35cd252d33fd0a219c8a2709efcd98
 
   decode  Go   3dab54339e520bb2c924826e3b72a917a2b612e9fd12fc867500f1d983a75827
           JS   3dab54339e520bb2c924826e3b72a917a2b612e9fd12fc867500f1d983a75827
@@ -172,19 +249,19 @@ framework dependencies.
 | ------------------- | -------------------------------------------------- |
 | `GET /`             | The browser player, embedded in the binary.        |
 | `GET /healthz`      | Liveness. Also `server --health-check`.            |
-| `GET /stats`        | Format, listener count, frames, drops.             |
+| `GET /stats`        | Format, listeners, frames, drops, bytes, suppression.             |
 | `GET /listen`       | WebSocket delivery. Low latency.                   |
 | `GET /stream.wav`   | Endless WAV. For media players, not browsers.      |
 | TCP `:9000`         | Source ingest.                                     |
 
 ## How a source is built
 
-Both sources run the same three stages in the same order:
+Both sources capture, detect activity, retain lead-in, and transmit through bounded queues:
 
 | Stage    | `internal/source`      | `esp32/src/main.cpp` |
 | -------- | ---------------------- | -------------------- |
 | capture  | miniaudio, or the tone | I2S reader task      |
-| encode   | `audio.Codec.Encode`   | `sonic::encodeFrame` |
+| encode   | `audio.EncodeMulaw`   | `sonic::encodeFrame` |
 | transmit | raw TCP                | TCP task             |
 
 They also share one policy: **capture never blocks on the network.** A full
@@ -192,10 +269,10 @@ buffer drops its oldest frame instead of stalling the capture, because a
 blocked audio callback overruns the driver and corrupts the capture, and stale
 audio is worth less than live audio. See `internal/queue`.
 
-The firmware deviates in one documented way: it encodes *before* the buffer
-that separates its two tasks, not after. RAM is the scarce resource on a
-microcontroller, so compressing first doubles the jitter tolerance the same
-buffer provides.
+Both sources encode before the network queue. Firmware also stores its lead-in
+as μ-law to conserve RAM. Quiet state stays in the local queue every frame; only
+its first record and five-second heartbeats are transmitted. Both queues drop
+the oldest entries and discard their backlog after reconnecting.
 
 ## The player
 
@@ -293,10 +370,8 @@ docker run --rm -p 8080:8080 -p 9000:9000 sonic-bridge:local
 
 ## Tuning
 
-There are eight command-line flags in total, three on the relay and five on the
-console. Everything else is a named constant, so tuning means editing one line
-and rebuilding. That is deliberate: a flag nobody sets is a maintenance cost
-and a false promise of configurability.
+Suppression settings are runtime console flags and firmware build options (see
+above). Transport and buffer sizes remain named constants.
 
 | Constant                  | Where                             | Default | Effect                                    |
 | ------------------------- | --------------------------------- | ------- | ----------------------------------------- |
@@ -306,10 +381,10 @@ and a false promise of configurability.
 | `PREFILL_MILLISECONDS`    | `internal/relay/web/index.html`   | 120     | Jitter absorbed before playback starts.    |
 | `SONIC_FRAME_SAMPLES`     | `esp32/secrets.ini`               | 320     | The firmware's frame size.                 |
 
-End-to-end latency is roughly one frame, plus the player's jitter buffer, plus
-the network. The honest failure mode is visible in the interface: a network
-that cannot keep up shows a rising **gaps** count, and a relay that cannot keep
-up shows drops in `/stats` and in its log.
+With suppression enabled, end-to-end latency includes 200 ms of lead-in, one
+frame, the player's jitter buffer, and the network. The player distinguishes Live, Quiet, and Waiting for a source. Its worklet
+counts unexpected underruns separately from intentional silence. Relay queue
+drops appear in `/stats` and the log.
 
 ## Testing
 
@@ -328,3 +403,19 @@ as a recognisable 440 Hz sine rather than merely as bytes.
 
 `make check` does not run `make wire`, because the wire check needs Node and a
 C++ compiler that a Go-only contributor may not have. CI runs both.
+
+The sparse-stream tests cover fragmented/malformed records, quiet joins, ten
+minutes of suppressed sample positions, PCM silence pacing, and event recovery.
+`make wire` also runs identical environmental PCM through Go and C++ and compares
+every activity decision. `make check` runs a Node worklet check and validates the
+inline player script as well as the standalone modules.
+
+`/stats` reports cumulative `ingressAudioBytes`, `ingressControlBytes`,
+`egressAudioBytes`, `egressControlBytes`, `wavBytes`, and `suppressedSeconds`.
+Ingress counts accepted source payload/header bytes; egress counts successfully
+written browser audio and application control bytes (summed over listeners).
+`wavBytes` includes PCM silence and WAV headers. Transport headers, TLS, HTTP
+handshakes, and WebSocket ping/pong bytes are excluded; use a packet capture to
+measure total network traffic. Suppressed duration advances with source sample
+positions, at most five seconds behind during quiet. Console logs report
+connection totals; firmware logs report five-second interval totals.

@@ -70,7 +70,7 @@
   <body>
     <h1>sonic-bridge</h1>
     <button id="listen" type="button" data-listening="false">Listen</button>
-    <p id="status">Idle</p>
+    <p id="status" role="status" aria-live="polite">Idle</p>
     <audio id="sink" playsinline hidden></audio>
 
     <script type="module">
@@ -98,6 +98,9 @@
       let worklet = null;
       let socket = null;
       let format = null;
+      let epoch = null;
+      let legacyPosition = 0;
+      let messages = Promise.resolve();
       let listening = false;
       let attempt = 0;
       let retry = null;
@@ -112,13 +115,16 @@
       // Awaiting before it loses the user gesture on iOS, and the result is
       // silence with no error.
       async function openPlayback(sampleRate) {
-        context = new AudioContext({ sampleRate });
+        const playbackContext = new AudioContext({ sampleRate });
+        context = playbackContext;
         output = context.createMediaStreamDestination();
         sink.srcObject = output.stream;
         sink.play().catch(() => undefined);
 
-        await context.audioWorklet.addModule("./playback-processor.js");
-        await context.resume();
+        await playbackContext.audioWorklet.addModule("./playback-processor.js");
+        if (context !== playbackContext) return;
+        await playbackContext.resume();
+        if (context !== playbackContext) return;
 
         worklet = new AudioWorkletNode(context, "playback-processor", {
           numberOfInputs: 0,
@@ -139,49 +145,81 @@
         output = null;
 
         if (context !== null) {
-          await context.close();
+          const previous = context;
           context = null;
+          await previous.close();
         }
       }
 
       // A jitter buffer cannot resample, so a stream whose rate differs from
       // the graph forces a rebuild. The page already has a gesture by now, so
       // the new context starts running.
-      async function applyFormat(payload) {
+      async function applyFormat(payload, connection) {
         let announced = null;
 
         try {
           announced = JSON.parse(payload);
         } catch {
-          show("The relay sent an unreadable format");
-
-          return;
+          throw new Error("The relay sent an unreadable format");
         }
 
-        if (announced.codec !== "mulaw" || announced.channels !== 1) {
-          show(`Cannot play ${announced.codec} with ${announced.channels} channels`);
-
+        if (announced === null || typeof announced !== "object") throw new Error("Invalid format");
+        if (announced.state === "waiting") {
+          format = null;
+          worklet?.port.postMessage({ type: "reset" });
+          show("Waiting for a source");
           return;
         }
-
-        format = announced;
-        attempt = 0;
-
-        if (context !== null && context.sampleRate !== format.sampleRate) {
+        if (announced.codec !== "mulaw" || announced.channels !== 1 ||
+            !Number.isInteger(announced.sampleRate) || announced.sampleRate < 4000 || announced.sampleRate > 48000 ||
+            !Number.isInteger(announced.frameSamples) || announced.frameSamples < 1 || announced.frameSamples > 65535 ||
+            !Number.isSafeInteger(announced.epoch) || !Number.isSafeInteger(announced.position) || announced.position < 0 ||
+            !["quiet", "live"].includes(announced.state) || typeof announced.sparse !== "boolean") {
+          throw new Error("The relay sent an unsupported format");
+        }
+        if (context !== null && context.sampleRate !== announced.sampleRate) {
           await closePlayback();
-          await openPlayback(format.sampleRate);
+          if (socket !== connection || !listening) return;
+          await openPlayback(announced.sampleRate);
+          if (socket !== connection || !listening) return;
         }
-
-        show("Live");
+        if (epoch !== announced.epoch) {
+          worklet?.port.postMessage({ type: "reset" });
+          legacyPosition = 0;
+        }
+        format = announced;
+        epoch = announced.epoch;
+        attempt = 0;
+        if (announced.state === "quiet") {
+          worklet?.port.postMessage({ type: "quiet", position: announced.position });
+        }
+        show(announced.state === "quiet" ? "Quiet" : "Live");
       }
 
       function playFrame(payload) {
-        if (format === null || worklet === null) {
-          return;
+        if (format === null || worklet === null) return;
+        let bytes = new Uint8Array(payload);
+        let position = legacyPosition;
+        if (format.sparse) {
+          if (bytes.length < 9) throw new Error("Truncated audio record");
+          const view = new DataView(payload);
+          position = Number(view.getBigUint64(1, true));
+          if (!Number.isSafeInteger(position) || position < 0 || position % format.frameSamples !== 0) {
+            throw new Error("Invalid audio position");
+          }
+          if (bytes[0] === 2 && bytes.length === 9) {
+            worklet.port.postMessage({ type: "quiet", position });
+            show("Quiet");
+            return;
+          }
+          if (bytes[0] !== 1) throw new Error("Invalid audio record");
+          bytes = bytes.subarray(9);
         }
-
-        const samples = toFloat32(decodeMulaw(new Uint8Array(payload)));
-        worklet.port.postMessage(samples, [samples.buffer]);
+        if (bytes.length !== format.frameSamples) throw new Error("Invalid audio frame size");
+        const samples = toFloat32(decodeMulaw(bytes));
+        worklet.port.postMessage({ type: "audio", position, samples }, [samples.buffer]);
+        legacyPosition = position + bytes.length;
+        show("Live");
       }
 
       function openSocket() {
@@ -189,24 +227,34 @@
           return;
         }
 
-        const url = new URL("/listen", window.location.href);
+        const url = new URL("/listen?v=2", window.location.href);
         url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
 
         socket = new WebSocket(url);
         socket.binaryType = "arraybuffer";
 
+        const connection = socket;
         socket.onmessage = (event) => {
-          if (typeof event.data === "string") {
-            applyFormat(event.data);
-
-            return;
-          }
-
-          playFrame(event.data);
+          // Serialize format changes and audio while an AudioContext rebuild awaits.
+          messages = messages.then(async () => {
+            if (socket !== connection || !listening) return;
+            if (typeof event.data === "string") await applyFormat(event.data, connection);
+            else playFrame(event.data);
+          }).catch((error) => {
+            if (socket === connection) {
+              show(error.message);
+              worklet?.port.postMessage({ type: "reset" });
+              connection.close();
+            }
+          });
         };
 
         socket.onclose = () => {
+          if (socket !== connection) return;
           socket = null;
+          format = null;
+          epoch = null;
+          worklet?.port.postMessage({ type: "reset" });
 
           if (!listening) {
             return;
@@ -261,6 +309,7 @@
         closeSocket();
         await closePlayback();
         format = null;
+        epoch = null;
         show("Idle");
       }
 

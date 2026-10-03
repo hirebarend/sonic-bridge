@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"time"
@@ -21,9 +22,8 @@ const defaultRelayPort = "9000"
 const relayTimeout = 5 * time.Second
 
 // relayConnection is the last stage of the pipeline. It carries encoded frames
-// to the relay over raw TCP: one binary format header, then frames back to
-// back. This is the same wire the ESP32 firmware speaks, which is why the two
-// sources can be compared line for line.
+// to the relay over raw TCP: a format header, then timestamped audio or quiet
+// records, matching the ESP32 firmware.
 type relayConnection struct {
 	conn net.Conn
 }
@@ -46,7 +46,7 @@ func dialRelay(ctx context.Context, addr string, format audio.Format) (*relayCon
 
 	relay := &relayConnection{conn: conn}
 
-	if err := relay.write(format.BuildHeader()); err != nil {
+	if err := relay.write(format.BuildSparseHeader()); err != nil {
 		relay.close()
 
 		return nil, fmt.Errorf("declaring the format: %w", err)
@@ -60,9 +60,17 @@ func (r *relayConnection) write(payload []byte) error {
 		return err
 	}
 
-	_, err := r.conn.Write(payload)
-
-	return err
+	for len(payload) > 0 {
+		n, err := r.conn.Write(payload)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		payload = payload[n:]
+	}
+	return nil
 }
 
 func (r *relayConnection) close() {

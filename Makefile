@@ -25,6 +25,7 @@ check: ## Verify formatting, vet, tests, the cgo-free build and the player synta
 	CGO_ENABLED=0 go build ./...
 	node --check internal/relay/web/codec.js
 	node --check internal/relay/web/playback-processor.js
+	node scripts/check-playback.mjs
 
 .PHONY: wire
 wire: ## Prove the Go, C++ and JavaScript wire implementations agree

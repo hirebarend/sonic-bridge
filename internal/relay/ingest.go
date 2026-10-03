@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"time"
@@ -13,7 +14,7 @@ import (
 // serveTcpSource accepts sources. This is the relay's only ingest transport:
 // the ESP32 firmware has no TLS or WebSocket stack, and the console speaks the
 // same wire so the two can be compared directly. A connection sends one binary
-// format header, then frames of that format back to back.
+// format header, then legacy frames or SB02 audio/quiet records.
 func (r *Relay) serveTcpSource(ctx context.Context) error {
 	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", r.config.TcpSourceAddr)
 	if err != nil {
@@ -78,7 +79,12 @@ func (r *Relay) readTcpSource(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	if !r.stream.AcquireSource(format) {
+	sparse := string(header[:4]) == "SB02"
+	acquire := r.stream.AcquireSource
+	if sparse {
+		acquire = r.stream.AcquireSparseSource
+	}
+	if !acquire(format) {
 		r.log.Warn("tcp source rejected, the stream already has a source", "remote", remote)
 
 		return
@@ -87,30 +93,48 @@ func (r *Relay) readTcpSource(ctx context.Context, conn net.Conn) {
 
 	r.log.Info("tcp source connected", "remote", remote, "format", format.String())
 
-	frames := r.readTcpFrames(conn, format, remote)
+	r.ingressControlBytes.Add(audio.HeaderBytes)
+	frames := r.readTcpFrames(conn, format, remote, sparse)
 
 	r.log.Info("tcp source disconnected", "remote", remote, "frames", frames)
 }
 
-func (r *Relay) readTcpFrames(conn net.Conn, format audio.Format, remote string) uint64 {
+func (r *Relay) readTcpFrames(conn net.Conn, format audio.Format, remote string, sparse bool) uint64 {
 	frameBytes := format.FrameBytes()
 
-	var frames uint64
+	var frames, nextPosition uint64
 	for {
-		frame := make([]byte, frameBytes)
 		_ = conn.SetReadDeadline(time.Now().Add(r.sourceTimeout))
-
-		if _, err := io.ReadFull(conn, frame); err != nil {
+		var record audio.Record
+		var err error
+		if sparse {
+			record, err = audio.ReadRecord(conn, format)
+			if err == nil && record.Position < nextPosition {
+				err = fmt.Errorf("sample position moved backwards")
+			}
+		} else {
+			record.Frame = make([]byte, frameBytes)
+			_, err = io.ReadFull(conn, record.Frame)
+		}
+		if err != nil {
 			if !isExpectedDisconnect(err) {
 				r.log.Warn("tcp source read failed", "remote", remote, "error", err)
 			}
-
 			return frames
 		}
-
-		r.stream.Publish(frame)
-		frames++
+		if sparse {
+			r.ingressControlBytes.Add(audio.RecordHeaderBytes)
+			nextPosition = record.Position + uint64(format.FrameSamples)
+			r.stream.PublishRecord(record)
+		} else {
+			r.stream.Publish(record.Frame)
+		}
+		r.ingressAudioBytes.Add(uint64(len(record.Frame)))
+		if !record.Quiet() {
+			frames++
+		}
 	}
+
 }
 
 // isExpectedDisconnect reports whether an error is an ordinary end of stream

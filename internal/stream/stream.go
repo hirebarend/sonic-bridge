@@ -16,8 +16,12 @@ import (
 // was encoded with, so a listener can never decode a frame with a stale
 // format after a source reconnects with different settings.
 type Packet struct {
-	Format audio.Format
-	Frame  []byte
+	Format   audio.Format
+	Frame    []byte
+	Position uint64
+	Epoch    uint64
+	State    string
+	Sparse   bool
 }
 
 // Listener is one attached destination. Frames arrive on Packets until the
@@ -40,9 +44,11 @@ func (l *Listener) Dropped() uint64 { return l.dropped.Load() }
 
 // Stream is the relay's single audio stream. It is safe for concurrent use.
 type Stream struct {
-	mu        sync.RWMutex
-	source    *audio.Format
-	listeners map[*Listener]struct{}
+	mu         sync.RWMutex
+	source     *audio.Format
+	listeners  map[*Listener]struct{}
+	current    Packet
+	suppressed float64
 
 	published atomic.Uint64
 	dropped   atomic.Uint64
@@ -57,6 +63,14 @@ func New() *Stream {
 // another producer already holds it, which is how a second source is turned
 // away instead of interleaving its audio with the first.
 func (s *Stream) AcquireSource(format audio.Format) bool {
+	return s.acquire(format, false)
+}
+
+func (s *Stream) AcquireSparseSource(format audio.Format) bool {
+	return s.acquire(format, true)
+}
+
+func (s *Stream) acquire(format audio.Format, sparse bool) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -65,6 +79,12 @@ func (s *Stream) AcquireSource(format audio.Format) bool {
 	}
 
 	s.source = &format
+	s.current = Packet{Format: format, Epoch: s.current.Epoch + 1, State: "live", Sparse: sparse}
+	if sparse {
+		for listener := range s.listeners {
+			s.deliver(listener, s.current)
+		}
+	}
 
 	return true
 }
@@ -75,6 +95,10 @@ func (s *Stream) ReleaseSource() {
 	defer s.mu.Unlock()
 
 	s.source = nil
+	s.current = Packet{Epoch: s.current.Epoch, State: "waiting"}
+	for listener := range s.listeners {
+		s.deliver(listener, s.current)
+	}
 }
 
 // FindFormat returns the format the live source declared, or nil when no
@@ -96,19 +120,43 @@ func (s *Stream) FindFormat() *audio.Format {
 // nothing when no source holds the stream. The frame is shared by reference
 // with every listener, so the caller must not reuse the slice.
 func (s *Stream) Publish(frame []byte) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.publish(audio.Record{Position: s.current.Position + uint64(s.current.Format.FrameSamples), Frame: frame})
+}
 
+func (s *Stream) PublishRecord(record audio.Record) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.publish(record)
+}
+
+func (s *Stream) publish(record audio.Record) {
 	if s.source == nil {
 		return
 	}
-
-	s.published.Add(1)
-	packet := Packet{Format: *s.source, Frame: frame}
-
+	if s.current.State == "quiet" && record.Position > s.current.Position {
+		s.suppressed += float64(record.Position-s.current.Position) / float64(s.source.SampleRate)
+	}
+	state := "live"
+	if record.Quiet() {
+		state = "quiet"
+	} else {
+		s.published.Add(1)
+	}
+	packet := Packet{Format: *s.source, Frame: record.Frame, Position: record.Position,
+		Epoch: s.current.Epoch, State: state, Sparse: s.current.Sparse}
+	s.current = packet
+	s.current.Frame = nil // A new listener gets state, never a stale audio frame.
 	for listener := range s.listeners {
 		s.deliver(listener, packet)
 	}
+}
+
+func (s *Stream) SuppressedSeconds() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.suppressed
 }
 
 // Attach registers a destination and returns its listener. The caller must
@@ -120,6 +168,9 @@ func (s *Stream) Attach(name string, queueDepth int) *Listener {
 	defer s.mu.Unlock()
 
 	s.listeners[listener] = struct{}{}
+	if s.source != nil && s.current.Sparse {
+		s.deliver(listener, s.current)
+	}
 
 	return listener
 }

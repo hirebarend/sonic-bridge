@@ -40,7 +40,7 @@ func startRelay(t *testing.T) (*Relay, *httptest.Server) {
 func dialListener(t *testing.T, ctx context.Context, server *httptest.Server) *websocket.Conn {
 	t.Helper()
 
-	url := "ws" + strings.TrimPrefix(server.URL, "http") + "/listen"
+	url := "ws" + strings.TrimPrefix(server.URL, "http") + "/listen?v=2"
 
 	conn, _, err := websocket.Dial(ctx, url, nil)
 	if err != nil {

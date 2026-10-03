@@ -3,7 +3,7 @@
 // relay over raw TCP.
 //
 // It speaks the same wire as the ESP32 firmware: one binary format header,
-// then frames back to back. See internal/source/source.go for the pipeline and
+// then timestamped audio/quiet records. See internal/source/source.go for the pipeline and
 // esp32/src/main.cpp for the firmware that mirrors it.
 package main
 
@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"sonic-bridge/internal/audio"
 	"sonic-bridge/internal/source"
 )
 
@@ -55,13 +56,19 @@ func parseFlags() (source.Config, bool) {
 		"print the capture devices this host exposes and exit")
 	gain := flag.Float64("gain", 1.0,
 		"linear gain applied before encoding, clipped at full scale")
+	suppression := flag.Bool("suppression", true, "suppress steady background sound (tone input always streams)")
+	sensitivity := flag.Float64("sensitivity-db", audio.DefaultSensitivityDB, "background change threshold in dB; lower is more sensitive (0.5..24)")
+	settle := flag.Duration("settle", audio.DefaultSettle, "stable period before suppression (1s..10m)")
 	flag.Parse()
 
 	config := source.Config{
-		ServerAddr: *server,
-		Input:      source.InputName(*input),
-		DeviceName: *deviceName,
-		Gain:       *gain,
+		ServerAddr:         *server,
+		Input:              source.InputName(*input),
+		DeviceName:         *deviceName,
+		Gain:               *gain,
+		DisableSuppression: !*suppression,
+		SensitivityDB:      *sensitivity,
+		Settle:             *settle,
 	}
 
 	return config, *listDevices

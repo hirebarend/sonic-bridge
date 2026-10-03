@@ -73,6 +73,14 @@ int main() {
 
     std::fwrite(encoded.data(), 1, encoded.size(), stdout);
     std::fwrite(header, 1, sizeof(header), stdout);
+    header[3] = '2';
+    std::fwrite(header, 1, sizeof(header), stdout);
+    uint8_t record[sonic::kRecordHeaderBytes];
+    sonic::buildRecordHeader(record, true, 80000);
+    std::fwrite(record, 1, sizeof(record), stdout);
+    sonic::buildRecordHeader(record, false, 80320);
+    std::fwrite(record, 1, sizeof(record), stdout);
+    for (int i=0; i<320; ++i) std::putchar(static_cast<uint8_t>(i));
 
     return 0;
 }
@@ -125,3 +133,10 @@ printf '          JS   %s\n\n' "$js_decode"
   fatal "Go and JS decode differently: the browser would play noise"
 
 log "Both pairs agree, over every 16-bit sample and every mu-law code."
+
+log "Environmental detector: identical PCM through Go and C++"
+SONIC_ACTIVITY_DIR="$WORK" go -C "$ROOT" test -run '^TestActivityEnvironmentalChanges$' -count=1 ./internal/audio/
+c++ -std=c++17 -O2 -Wall -Wextra -I "$ROOT/esp32/src" "$ROOT/scripts/check-activity.cpp" -o "$WORK/activity"
+"$WORK/activity" <"$WORK/activity.pcm" >"$WORK/cpp-activity.bin"
+cmp "$WORK/go-activity.bin" "$WORK/cpp-activity.bin" || fatal "Go and C++ activity decisions differ"
+log "Activity decisions agree across silence, hiss, hum, impacts, and recurring activity."

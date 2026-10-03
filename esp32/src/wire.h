@@ -3,7 +3,7 @@
 // This header is deliberately free of Arduino and ESP-IDF dependencies so the
 // bit-level code can be compiled and verified on a development machine. Run
 // scripts/check-wire-format.sh to confirm it agrees byte for byte with
-// internal/audio (Go) and web/src/lib (TypeScript).
+// internal/audio (Go) and internal/relay/web/codec.js (JavaScript).
 
 #ifndef SONIC_WIRE_H
 #define SONIC_WIRE_H
@@ -39,6 +39,14 @@ inline size_t buildStreamHeader(uint8_t* out, CodecId codec, uint32_t sampleRate
     out[11] = static_cast<uint8_t>((sampleRate >> 24) & 0xFF);
 
     return kHeaderBytes;
+}
+
+// SB02: one byte kind (1 audio, 2 quiet), uint64 LE sample position,
+// then exactly frameSamples mu-law bytes for audio, no payload for quiet.
+constexpr size_t kRecordHeaderBytes = 9;
+inline void buildRecordHeader(uint8_t* out, bool quiet, uint64_t position) {
+    out[0] = quiet ? 2 : 1;
+    for (int i=0; i<8; ++i) out[i+1] = static_cast<uint8_t>(position >> (8*i));
 }
 
 // ITU-T G.711 mu-law. Mirror of internal/audio/codec.go. The segment table and

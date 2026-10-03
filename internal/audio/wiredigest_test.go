@@ -24,6 +24,13 @@ func TestWriteWireEncodeArtefact(t *testing.T) {
 
 	format := Format{Codec: CodecMulaw, SampleRate: 16000, Channels: 1, FrameSamples: 320}
 	payload := append(EncodeMulaw(samples), format.BuildHeader()...)
+	payload = append(payload, format.BuildSparseHeader()...)
+	payload = append(payload, (Record{Position: 80000}).Bytes()...)
+	frame := make([]byte, 320)
+	for i := range frame {
+		frame[i] = byte(i)
+	}
+	payload = append(payload, (Record{Position: 80320, Frame: frame}).Bytes()...)
 
 	if err := os.WriteFile(path, payload, 0o644); err != nil {
 		t.Fatal(err)

@@ -103,7 +103,7 @@ func ParseHeader(header []byte) (Format, error) {
 		return Format{}, fmt.Errorf("header needs %d bytes, got %d", HeaderBytes, len(header))
 	}
 
-	if string(header[:4]) != headerMagic {
+	if string(header[:4]) != headerMagic && string(header[:4]) != "SB02" {
 		return Format{}, errors.New("bad magic: not a sonic-bridge stream header")
 	}
 

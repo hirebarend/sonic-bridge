@@ -39,14 +39,16 @@ func (r *Relay) handleWebSocketListener(w http.ResponseWriter, req *http.Request
 		r.log.Info("listener detached", "remote", listener.Name(), "dropped", listener.Dropped())
 	}()
 
-	r.pumpWebSocket(req.Context(), conn, listener)
+	r.pumpWebSocket(conn.CloseRead(req.Context()), conn, listener, req.URL.Query().Get("v") == "2")
 }
 
-func (r *Relay) pumpWebSocket(ctx context.Context, conn *websocket.Conn, listener *stream.Listener) {
+func (r *Relay) pumpWebSocket(ctx context.Context, conn *websocket.Conn, listener *stream.Listener, sparseSupported bool) {
 	dropReports := time.NewTicker(dropReportInterval)
 	defer dropReports.Stop()
 
 	var announced audio.Format
+	var epoch uint64
+	var ticks int
 	var reportedDrops uint64
 
 	for {
@@ -55,24 +57,57 @@ func (r *Relay) pumpWebSocket(ctx context.Context, conn *websocket.Conn, listene
 			return
 		case <-dropReports.C:
 			reportedDrops = r.reportDrops(listener, reportedDrops)
+			ticks++
+			if ticks%4 == 0 {
+				// Waiting for a pong must not stall audio by one network RTT.
+				// A failed Ping closes the connection and cancels CloseRead.
+				go func() {
+					pingCtx, cancel := context.WithTimeout(ctx, writeTimeout)
+					defer cancel()
+					_ = conn.Ping(pingCtx)
+				}()
+			}
 		case packet, ok := <-listener.Packets():
 			if !ok {
 				return
 			}
 
-			if packet.Format != announced {
-				if err := writeJsonMessage(ctx, conn, packet.Format); err != nil {
-					return
-				}
-
-				announced = packet.Format
-			}
-
-			// A listener that disappears mid-write is an ordinary departure,
-			// and the deferred log line already records it with its drop count.
-			if err := writeMessage(ctx, conn, websocket.MessageBinary, packet.Frame); err != nil {
+			if packet.Sparse && !sparseSupported {
+				_ = conn.Close(websocket.StatusPolicyViolation, "Reload the player for the updated audio protocol")
 				return
 			}
+			if packet.State == "waiting" {
+				if err := r.writeControl(ctx, conn, map[string]any{"state": "waiting"}); err != nil {
+					return
+				}
+				announced = audio.Format{}
+				continue
+			}
+			if packet.Format != announced || packet.Epoch != epoch {
+				announcement := struct {
+					audio.Format
+					Epoch    uint64 `json:"epoch"`
+					Sparse   bool   `json:"sparse"`
+					State    string `json:"state"`
+					Position uint64 `json:"position"`
+				}{packet.Format, packet.Epoch, packet.Sparse, packet.State, packet.Position}
+				if err := r.writeControl(ctx, conn, announcement); err != nil {
+					return
+				}
+				announced, epoch = packet.Format, packet.Epoch
+			}
+			if packet.State == "live" && len(packet.Frame) == 0 {
+				continue
+			}
+			payload := packet.Frame
+			if packet.Sparse {
+				payload = (audio.Record{Position: packet.Position, Frame: packet.Frame}).Bytes()
+			}
+			if err := writeMessage(ctx, conn, websocket.MessageBinary, payload); err != nil {
+				return
+			}
+			r.egressAudioBytes.Add(uint64(len(packet.Frame)))
+			r.egressControlBytes.Add(uint64(len(payload) - len(packet.Frame)))
 		}
 	}
 }
@@ -115,47 +150,14 @@ func (r *Relay) handleWavListener(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
-	if _, err := w.Write(audio.BuildLiveWavHeader(first.Format.SampleRate, first.Format.Channels)); err != nil {
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(writeTimeout))
+	n, err := w.Write(audio.BuildLiveWavHeader(first.Format.SampleRate, first.Format.Channels))
+	r.wavBytes.Add(uint64(n))
+	if err != nil {
 		return
 	}
 
 	r.pumpWav(ctx, w, flusher, listener, first)
-}
-
-func (r *Relay) pumpWav(
-	ctx context.Context,
-	w http.ResponseWriter,
-	flusher http.Flusher,
-	listener *stream.Listener,
-	first stream.Packet,
-) {
-	format := first.Format
-	packet := first
-
-	for {
-		// A RIFF header cannot be amended mid-file, so a source that
-		// reconnects with a different format ends this response.
-		if packet.Format != format {
-			return
-		}
-
-		if _, err := w.Write(audio.EncodePcm16(audio.DecodeMulaw(packet.Frame))); err != nil {
-			return
-		}
-
-		flusher.Flush()
-
-		select {
-		case <-ctx.Done():
-			return
-		case next, ok := <-listener.Packets():
-			if !ok {
-				return
-			}
-
-			packet = next
-		}
-	}
 }
 
 // waitForPacket blocks for the first frame so a WAV header can describe the
@@ -164,14 +166,92 @@ func waitForPacket(ctx context.Context, listener *stream.Listener, timeout time.
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 
-	select {
-	case <-ctx.Done():
-		return stream.Packet{}, false
-	case <-deadline.C:
-		return stream.Packet{}, false
-	case packet, ok := <-listener.Packets():
-		return packet, ok
+	for {
+		select {
+		case <-ctx.Done():
+			return stream.Packet{}, false
+		case <-deadline.C:
+			return stream.Packet{}, false
+		case packet, ok := <-listener.Packets():
+			if !ok {
+				return stream.Packet{}, false
+			}
+			if packet.State == "waiting" || (packet.State == "live" && len(packet.Frame) == 0) {
+				continue
+			}
+			return packet, true
+		}
 	}
+}
+
+// WAV uses a local clock only while the source explicitly declares quiet.
+// Heartbeats do not append five seconds of zeros or restart the playback clock.
+func (r *Relay) pumpWav(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, listener *stream.Listener, first stream.Packet) {
+	ticker := time.NewTicker(first.Format.FrameDuration())
+	ticker.Stop()
+	defer ticker.Stop()
+	var silenceTicks <-chan time.Time
+	zeros := make([]byte, first.Format.FrameSamples*2)
+	packet := first
+	quiet := false
+	write := func(payload []byte) bool {
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(writeTimeout))
+		n, err := w.Write(payload)
+		r.wavBytes.Add(uint64(n))
+		if err != nil {
+			return false
+		}
+		flusher.Flush()
+		return true
+	}
+	for {
+		if packet.Epoch != first.Epoch || packet.Format != first.Format || packet.State == "waiting" {
+			return
+		}
+		if packet.State == "quiet" {
+			if !quiet {
+				ticker.Reset(first.Format.FrameDuration())
+				silenceTicks = ticker.C
+			}
+			quiet = true
+		} else if len(packet.Frame) > 0 {
+			quiet = false
+			ticker.Stop()
+			silenceTicks = nil
+			if !write(audio.EncodePcm16(audio.DecodeMulaw(packet.Frame))) {
+				return
+			}
+		}
+		// Stay here across silence ticks, so an audio frame is never written twice.
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-silenceTicks:
+				if quiet && !write(zeros) {
+					return
+				}
+				continue
+			case next, ok := <-listener.Packets():
+				if !ok {
+					return
+				}
+				packet = next
+			}
+			break
+		}
+	}
+}
+
+func (r *Relay) writeControl(ctx context.Context, conn *websocket.Conn, payload any) error {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	if err = writeMessage(ctx, conn, websocket.MessageText, encoded); err == nil {
+		r.egressControlBytes.Add(uint64(len(encoded)))
+	}
+	return err
 }
 
 func (r *Relay) reportDrops(listener *stream.Listener, reported uint64) uint64 {
@@ -187,15 +267,6 @@ func (r *Relay) reportDrops(listener *stream.Listener, reported uint64) uint64 {
 		"interval", dropReportInterval)
 
 	return current
-}
-
-func writeJsonMessage(ctx context.Context, conn *websocket.Conn, payload any) error {
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-
-	return writeMessage(ctx, conn, websocket.MessageText, encoded)
 }
 
 func writeMessage(

@@ -223,3 +223,24 @@ func TestConcurrentPublishAttachDetach(t *testing.T) {
 	close(done)
 	wg.Wait()
 }
+
+func TestSparseStateSurvivesDropsAndSourceReplacement(t *testing.T) {
+	s := New()
+	s.AcquireSparseSource(testFormat())
+	l := s.Attach("slow", 1)
+	defer s.Detach(l)
+	first := <-l.Packets()
+	s.PublishRecord(audio.Record{Position: 0, Frame: []byte{1}})
+	s.PublishRecord(audio.Record{Position: 320})
+	s.PublishRecord(audio.Record{Position: 80320})
+	got := <-l.Packets()
+	if got.State != "quiet" || got.Position != 80320 {
+		t.Fatal("latest state lost", got)
+	}
+	s.ReleaseSource()
+	s.AcquireSparseSource(testFormat())
+	got = <-l.Packets()
+	if got.Epoch == first.Epoch || got.State != "live" {
+		t.Fatal("same-format replacement needs new identity")
+	}
+}

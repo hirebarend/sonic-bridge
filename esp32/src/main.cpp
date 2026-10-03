@@ -1,21 +1,9 @@
 // sonic-bridge ESP32-C3 firmware: an audio source.
 //
-// It runs the same three stages as the console and the browser source, in the
-// same order:
-//
-//   capture   an I2S task reads the microphone and shifts 32-bit slots to int16
-//   encode    sonic::encodeFrame turns samples into wire bytes
-//   transmit  a TCP task sends the stream header once, then frames
-//
-// One deliberate difference: encoding happens before the buffer that separates
-// the two tasks, not after it. RAM is the scarce resource here, so compressing
-// first doubles the jitter tolerance the same buffer gives. The console and the
-// browser encode after their buffer, where memory is free.
-//
-// The two tasks are decoupled so that a blocked TCP write can never stall
-// i2s_channel_read, which would overrun the I2S DMA and corrupt the capture.
-// When the ring fills, the newest frame is dropped rather than the capture
-// being held up, which is the same policy internal/queue applies in Go.
+// Capture analyzes environmental activity, retains 200 ms of pre-roll, and
+// hands fixed frames/state to a bounded drop-oldest queue. Transmit sends SB02
+// records, coalescing quiet states into five-second heartbeats. Capture never
+// waits on network I/O.
 //
 // Configuration comes from build flags, set in secrets.ini. Copy
 // secrets.ini.example and fill it in; the real file is not tracked by git.
@@ -33,6 +21,7 @@
 // most modules), 20-21 (UART0 used by Serial) and the strapping pins 2/8/9.
 
 #include <Arduino.h>
+#include <atomic>
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <lwip/sockets.h>
@@ -40,10 +29,11 @@
 #include "driver/i2s_std.h"
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/ringbuf.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 
 #include "wire.h"
+#include "activity.h"
 
 #ifndef SONIC_WIFI_SSID
 #define SONIC_WIFI_SSID "set-wifi-ssid-in-secrets-ini"
@@ -66,6 +56,17 @@
 #endif
 #ifndef SONIC_FRAME_SAMPLES
 #define SONIC_FRAME_SAMPLES 320
+#endif
+
+// Suppression tuning: lower dB means more sensitive to environmental changes.
+#ifndef SONIC_SUPPRESSION
+#define SONIC_SUPPRESSION 1
+#endif
+#ifndef SONIC_SENSITIVITY_DB
+#define SONIC_SENSITIVITY_DB 3.0
+#endif
+#ifndef SONIC_SETTLE_SECONDS
+#define SONIC_SETTLE_SECONDS 30
 #endif
 
 // Microphone and pinout.
@@ -100,29 +101,33 @@ constexpr uint16_t kFrameSamples = SONIC_FRAME_SAMPLES;
 constexpr size_t kFrameBytes = kFrameSamples;
 constexpr int kInmpShift = SONIC_INMP441_SHIFT;
 
-// RINGBUF_TYPE_NOSPLIT stores an 8-byte header per item and aligns items to
-// four bytes, so the usable capacity is well below the raw byte count. Sizing
-// from the real per-item cost is what makes "one second" true rather than
-// aspirational.
-constexpr size_t kRingItemOverhead = 8;
-constexpr size_t kRingItemBytes = ((kFrameBytes + 3) & ~static_cast<size_t>(3)) + kRingItemOverhead;
-constexpr size_t kRingFrames = kSampleRate / kFrameSamples;
-constexpr size_t kRingBytes = kRingFrames * kRingItemBytes;
-
+static_assert(kSampleRate >= 4000 && kSampleRate <= 48000, "unsupported sample rate");
+static_assert(kFrameSamples > 0, "frame size must be positive");
+static_assert(kInmpShift >= 0 && kInmpShift <= 31, "invalid microphone shift");
+static_assert(SONIC_SENSITIVITY_DB >= 0.5 && SONIC_SENSITIVITY_DB <= 24, "invalid sensitivity");
+static_assert(SONIC_SETTLE_SECONDS >= 1 && SONIC_SETTLE_SECONDS <= 600, "invalid settle period");
+constexpr size_t kPreFrames = (kSampleRate/5 + kFrameSamples-1)/kFrameSamples;
+constexpr size_t kQueueFrames = 16;
+struct Frame {
+    uint64_t position;
+    bool quiet;
+    uint8_t audio[kFrameBytes];
+};
+// Encoded pre-roll avoids a second PCM buffer on the microcontroller.
+Frame g_preRoll[kPreFrames];
 constexpr uint32_t kStatusIntervalMs = 5000;
 
 i2s_chan_handle_t g_capture = nullptr;
-RingbufHandle_t g_frames = nullptr;
+QueueHandle_t g_frames = nullptr;
 WiFiClient g_relay;
 
 // Scratch buffers owned by the capture task alone.
 int32_t g_slotBuffer[kFrameSamples];
 int16_t g_sampleBuffer[kFrameSamples];
-uint8_t g_frameBuffer[kFrameSamples];
 
-volatile uint32_t g_droppedFrames = 0;
-volatile uint32_t g_sentFrames = 0;
-volatile int16_t g_peakSample = 0;
+
+std::atomic<uint32_t> g_droppedFrames{0}, g_sentFrames{0}, g_audioBytes{0}, g_controlBytes{0}, g_quietFrames{0};
+std::atomic<int> g_peakSample{0};
 
 bool startCapture() {
     i2s_chan_config_t channelConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
@@ -202,12 +207,8 @@ void shiftSlotsToSamples(const int32_t* slots, size_t sampleCount, int16_t* samp
 }
 
 void discardBufferedFrames() {
-    size_t itemBytes = 0;
-
-    for (void* item = xRingbufferReceive(g_frames, &itemBytes, 0); item != nullptr;
-         item = xRingbufferReceive(g_frames, &itemBytes, 0)) {
-        vRingbufferReturnItem(g_frames, item);
-    }
+    Frame discarded;
+    while (xQueueReceive(g_frames, &discarded, 0) == pdTRUE) {}
 }
 
 bool writeAll(const uint8_t* payload, size_t payloadBytes) {
@@ -278,6 +279,7 @@ bool ensureRelay() {
 
     uint8_t header[sonic::kHeaderBytes];
     const size_t headerBytes = sonic::buildStreamHeader(header, sonic::kCodecMulaw, kSampleRate, kFrameSamples);
+    header[3] = '2';
 
     if (!writeAll(header, headerBytes)) {
         Serial.println("could not send the stream header");
@@ -285,6 +287,7 @@ bool ensureRelay() {
         return false;
     }
 
+    g_controlBytes += headerBytes;
     discardBufferedFrames();
     Serial.printf("relay connected, streaming mulaw at %u Hz, %u samples per frame\n",
                   static_cast<unsigned>(kSampleRate),
@@ -294,52 +297,74 @@ bool ensureRelay() {
 }
 
 void captureTask(void*) {
+    sonic::Activity detector(kSampleRate, SONIC_SENSITIVITY_DB, SONIC_SETTLE_SECONDS);
+    size_t pending = 0, index = 0, filled = 0;
+    uint64_t position = 0;
     for (;;) {
         size_t bytesRead = 0;
-        const esp_err_t status =
-            i2s_channel_read(g_capture, g_slotBuffer, sizeof(g_slotBuffer), &bytesRead, portMAX_DELAY);
-
+        const esp_err_t status = i2s_channel_read(g_capture,
+            reinterpret_cast<uint8_t*>(g_slotBuffer)+pending,
+            sizeof(g_slotBuffer)-pending, &bytesRead, portMAX_DELAY);
         if (status != ESP_OK) {
+            pending = 0;
             Serial.printf("i2s read error: %d\n", status);
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
-
-        const size_t sampleCount = bytesRead / sizeof(int32_t);
-        shiftSlotsToSamples(g_slotBuffer, sampleCount, g_sampleBuffer);
-
-        const size_t frameBytes = sonic::encodeFrame(g_sampleBuffer, sampleCount, g_frameBuffer);
-
-        if (xRingbufferSend(g_frames, g_frameBuffer, frameBytes, 0) != pdTRUE) {
-            ++g_droppedFrames;
+        pending += bytesRead;
+        if (pending < sizeof(g_slotBuffer)) continue;
+        pending = 0;
+        shiftSlotsToSamples(g_slotBuffer, kFrameSamples, g_sampleBuffer);
+        const bool active = !SONIC_SUPPRESSION || detector.active(g_sampleBuffer, kFrameSamples);
+        Frame current{};
+        current.position = position;
+        current.quiet = !active;
+        sonic::encodeFrame(g_sampleBuffer, kFrameSamples, current.audio);
+        position += kFrameSamples;
+        Frame output = current;
+        if (SONIC_SUPPRESSION) {
+            output = g_preRoll[index];
+            g_preRoll[index] = current;
+            index = (index+1)%kPreFrames;
+            if (filled < kPreFrames) { ++filled; continue; }
+            output.quiet = output.quiet && !active;
+        }
+        if (output.quiet) ++g_quietFrames;
+        if (xQueueSend(g_frames, &output, 0) != pdTRUE) {
+            Frame discarded;
+            if (xQueueReceive(g_frames, &discarded, 0) == pdTRUE) ++g_droppedFrames;
+            xQueueSend(g_frames, &output, 0);
         }
     }
 }
 
 void transmitTask(void*) {
+    bool quiet = false;
+    uint32_t lastQuiet = 0;
     for (;;) {
+        const bool wasConnected = g_relay.connected();
         if (!ensureNetwork() || !ensureRelay()) {
+            quiet = false;
             vTaskDelay(pdMS_TO_TICKS(SONIC_RECONNECT_MS));
             continue;
         }
-
-        size_t itemBytes = 0;
-        // A bounded wait lets the loop recheck WiFi and relay liveness.
-        void* item = xRingbufferReceive(g_frames, &itemBytes, pdMS_TO_TICKS(100));
-
-        if (item == nullptr) {
+        if (!wasConnected) quiet = false;
+        Frame frame;
+        if (xQueueReceive(g_frames, &frame, pdMS_TO_TICKS(100)) != pdTRUE) continue;
+        if (frame.quiet && quiet && static_cast<uint32_t>(millis()-lastQuiet) < 5000) continue;
+        uint8_t record[sonic::kRecordHeaderBytes+kFrameBytes];
+        sonic::buildRecordHeader(record, frame.quiet, frame.position);
+        size_t bytes = sonic::kRecordHeaderBytes;
+        if (!frame.quiet) { memcpy(record+bytes, frame.audio, kFrameBytes); bytes += kFrameBytes; }
+        if (writeAll(record, bytes)) {
+            quiet = frame.quiet;
+            g_controlBytes += sonic::kRecordHeaderBytes;
+            if (quiet) lastQuiet = millis();
+            else { ++g_sentFrames; g_audioBytes += kFrameBytes; }
             continue;
         }
-
-        const bool sent = writeAll(static_cast<const uint8_t*>(item), itemBytes);
-        vRingbufferReturnItem(g_frames, item);
-
-        if (sent) {
-            ++g_sentFrames;
-            continue;
-        }
-
         Serial.println("relay write failed, reconnecting");
+        quiet = false;
         g_relay.stop();
         discardBufferedFrames();
         vTaskDelay(pdMS_TO_TICKS(SONIC_RECONNECT_MS));
@@ -360,16 +385,17 @@ void setup() {
         }
     }
 
-    g_frames = xRingbufferCreate(kRingBytes, RINGBUF_TYPE_NOSPLIT);
+    g_frames = xQueueCreate(kQueueFrames, sizeof(Frame));
     if (g_frames == nullptr) {
-        Serial.println("FATAL: xRingbufferCreate failed, halting");
+        Serial.println("FATAL: xQueueCreate failed, halting");
         while (true) {
             delay(1000);
         }
     }
 
-    Serial.printf("frame buffer holds %u frames (%u bytes, about one second)\n",
-                  static_cast<unsigned>(kRingFrames), static_cast<unsigned>(kRingBytes));
+    Serial.printf("queue=%u frames, pre-roll=%u frames, suppression=%d, settle=%ds\n",
+                  static_cast<unsigned>(kQueueFrames), static_cast<unsigned>(kPreFrames),
+                  SONIC_SUPPRESSION, SONIC_SETTLE_SECONDS);
 
     // Capture runs at a high priority with a small stack: it must never be
     // starved. Transmit owns WiFi and TCP and is allowed to block.
@@ -380,9 +406,11 @@ void setup() {
 void loop() {
     delay(kStatusIntervalMs);
 
-    Serial.printf("streaming frames=%u dropped=%u peak=%d rssi=%d\n",
-                  static_cast<unsigned>(g_sentFrames),
-                  static_cast<unsigned>(g_droppedFrames),
-                  static_cast<int>(g_peakSample),
-                  WiFi.RSSI());
+    Serial.printf("last_5s frames=%u dropped=%u audio_bytes=%u control_bytes=%u suppressed_ms=%u peak=%d rssi=%d\n",
+                  static_cast<unsigned>(g_sentFrames.exchange(0)),
+                  static_cast<unsigned>(g_droppedFrames.exchange(0)),
+                  static_cast<unsigned>(g_audioBytes.exchange(0)),
+                  static_cast<unsigned>(g_controlBytes.exchange(0)),
+                  static_cast<unsigned>(g_quietFrames.exchange(0)*kFrameSamples*1000/kSampleRate),
+                  g_peakSample.load(), WiFi.RSSI());
 }
